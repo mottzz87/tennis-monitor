@@ -13,19 +13,28 @@ const TARGET_PLACE = [
 let currentData = []
 let currentVersion = 0
 let booking = false
-
+let browser
 // ========================
 // 通用点击（更稳）
 // ========================
 async function clickByText(page, text) {
   await page.getByText(text, { exact: false }).first().click()
 }
+async function getBrowser() {
+  if (!browser) {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    })
+  }
+  return browser
+}
 
 // ========================
 // 监控
 // ========================
 async function monitor() {
-  const browser = await chromium.launch({ headless: true })
+  const browser = await getBrowser()
   const page = await browser.newPage()
 
   await page.goto('https://reserve.city.ichikawa.lg.jp/')
