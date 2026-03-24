@@ -350,4 +350,4 @@ async function clickApply(page) {
 // ========================
 monitor()
 
-// setInterval(monitor, 5 * 60 * 1000)
+setInterval(monitor, 3 * 60 * 1000)
