@@ -14,6 +14,11 @@ let currentVersion = 0
 let booking = false
 let browser
 let lastHash = ''
+let lastSet = new Set()
+
+function getKey(d) {
+  return `${d.place}_${d.court}_${d.date}_${d.time}`
+}
 
 // ========================
 async function getBrowser() {
@@ -147,12 +152,33 @@ async function monitor() {
 
     lastHash = hash
 
-    if (data.length > 0) {
-      currentData = data
-      currentVersion = Date.now()
+    const newSet = new Set(data.map(getKey))
 
-      await sendTelegram(data, currentVersion)
+    // 🟡 第一次运行（不推送）
+    if (lastSet.size === 0) {
+      lastSet = newSet
+      console.log('🟡 初始化，不推送')
+      return
     }
+
+    // 🆕 找新增
+    const added = data.filter(d => !lastSet.has(getKey(d)))
+
+    if (added.length === 0) {
+      console.log('⏸️ 没新增')
+      return
+    }
+
+    // ✅ 更新缓存
+    lastSet = newSet
+
+    console.log(`🆕 新增 ${added.length} 个`)
+
+    // ✅ 只推新增
+    currentData = added
+    currentVersion = Date.now()
+
+    await sendTelegram(added, currentVersion)
 
   } catch (e) {
     console.log('❌ monitor错误:', e.message)
