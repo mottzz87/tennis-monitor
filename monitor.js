@@ -1,20 +1,44 @@
 require('dotenv').config()
+const fs = require('fs')
 const { chromium } = require('playwright')
 const TelegramBot = require('node-telegram-bot-api')
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true })
+// ========================
+// ✅ 读取配置
+// ========================
+let config = JSON.parse(fs.readFileSync('./config.json', 'utf-8'))
 
-const TARGET_PLACE = [
-  '菅野終末処理場テニスコート',
-  '福栄スポーツ広場テニスコート',
-]
+function saveConfig() {
+  fs.writeFileSync('./config.json', JSON.stringify(config, null, 2))
+}
+
+// ========================
+// ✅ 持久化 lastSet
+// ========================
+let lastSet = new Set()
+
+function loadLastSet() {
+  try {
+    const data = JSON.parse(fs.readFileSync('./lastSet.json', 'utf-8'))
+    lastSet = new Set(data)
+    console.log('✅ 已加载 lastSet')
+  } catch {
+    console.log('⚠️ 没有历史 lastSet')
+  }
+}
+
+function saveLastSet() {
+  fs.writeFileSync('./lastSet.json', JSON.stringify([...lastSet]))
+}
+
+// ========================
+const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true })
 
 let currentData = []
 let currentVersion = 0
 let booking = false
 let browser
-let lastHash = ''
-let lastSet = new Set()
+let isFirstRun = true
 
 function getKey(d) {
   return `${d.place}_${d.court}_${d.date}_${d.time}`
@@ -36,12 +60,24 @@ async function clickByText(page, text) {
 }
 
 // ========================
-// ✅ 数据 hash（去重推送核心）
+// ✅ 过滤器
 // ========================
-function genHash(data) {
-  return JSON.stringify(
-    data.map(d => `${d.place}_${d.court}_${d.date}_${d.time}`)
-  )
+function filterData(data) {
+  return data.filter(d => {
+
+    // 时间过滤
+    if (config.TIME_FILTER.length > 0) {
+      if (!config.TIME_FILTER.some(t => d.time.includes(t))) return false
+    }
+
+    // 星期过滤
+    if (config.WEEKDAY_FILTER.length > 0) {
+      const match = d.date.match(/（(.)）/)
+      if (!match || !config.WEEKDAY_FILTER.includes(match[1])) return false
+    }
+
+    return true
+  })
 }
 
 // ========================
@@ -56,7 +92,7 @@ async function monitor() {
 
     await clickByText(page, 'スポーツ施設')
 
-    for (const place of TARGET_PLACE) {
+    for (const place of config.TARGET_PLACE) {
       await clickByText(page, place)
     }
 
@@ -72,7 +108,6 @@ async function monitor() {
       page.click('#ucPCFooter_btnForward')
     ])
 
-    // 👉 选 ○ △
     await page.evaluate(() => {
       document.querySelectorAll('table[id*="dgTable"] a').forEach(a => {
         const val = a.innerText.replace(/\s/g, '')
@@ -85,13 +120,9 @@ async function monitor() {
       page.click('#ucPCFooter_btnForward')
     ])
 
-    // ========================
-    // ✅ 解析
-    // ========================
-    const data = await page.evaluate(() => {
+    const rawData = await page.evaluate(() => {
       const result = []
       let currentPlace = ''
-
       const tables = document.querySelectorAll('table')
 
       for (const table of tables) {
@@ -105,8 +136,6 @@ async function monitor() {
         if (!table.id || !table.id.includes('dgTable')) continue
 
         const rows = table.querySelectorAll('tr')
-        if (rows.length < 2) continue
-
         const headers = rows[0].querySelectorAll('td')
 
         const times = []
@@ -140,45 +169,82 @@ async function monitor() {
       return result
     })
 
+    await page.close()
+
+    const data = filterData(rawData)
+
     console.log('可预约:', data.length)
-
-    const hash = genHash(data)
-
-    // ✅ 无变化 → 不推送
-    if (hash === lastHash) {
-      console.log('⏸️ 无变化，不推送')
-      return
-    }
-
-    lastHash = hash
 
     const newSet = new Set(data.map(getKey))
 
-    // 🟡 第一次运行（不推送）
+    // 首次
     if (lastSet.size === 0) {
       lastSet = newSet
-      console.log('🟡 初始化，不推送')
+      saveLastSet()
+    
+      console.log('🟡 初始化')
+    
+      if (config.PUSH_ON_INIT && data.length > 0) {
+        console.log('🚀 首次推送')
+    
+        currentData = data
+        currentVersion = Date.now()
+    
+        await sendTelegram(data, currentVersion)
+      }
+    
       return
     }
 
-    // 🆕 找新增
     const added = data.filter(d => !lastSet.has(getKey(d)))
+    const removed = [...lastSet]
+      .filter(k => !newSet.has(k))
+      .map(k => {
+        const [place, court, date, time] = k.split('_')
+        return { place, court, date, time }
+      })
 
-    if (added.length === 0) {
-      console.log('⏸️ 没新增')
-      return
+      if (isFirstRun) {
+        isFirstRun = false
+      
+        console.log('🚀 首次运行，强制推送')
+      
+        if (data.length > 0) {
+          currentData = data
+          currentVersion = Date.now()
+      
+          await sendTelegram(data, currentVersion)
+        } else {
+          await bot.sendMessage(process.env.CHAT_ID, '⚠️ 当前没有可预约场地')
+        }
+      
+        // ⚠️ 注意：首次之后再更新 lastSet
+        lastSet = newSet
+        saveLastSet()
+      
+        return
+      }
+
+    lastSet = newSet
+    saveLastSet()
+
+    // 新增
+    if (added.length > 0) {
+      currentData = added
+      currentVersion = Date.now()
+
+      await sendTelegram(added, currentVersion)
+
+      // 自动预约
+      if (config.AUTO_BOOK) {
+        await bookOne(added[0])
+      }
     }
 
-    // ✅ 更新缓存
-    lastSet = newSet
-
-    console.log(`🆕 新增 ${added.length} 个`)
-
-    // ✅ 只推新增
-    currentData = added
-    currentVersion = Date.now()
-
-    await sendTelegram(added, currentVersion)
+    // 减少
+    if (removed.length > 0) {
+      await sendRemovedTelegram(removed)
+    }
 
   } catch (e) {
     console.log('❌ monitor错误:', e.message)
@@ -186,143 +252,61 @@ async function monitor() {
 }
 
 // ========================
-// Telegram
+// Telegram 推送
 // ========================
 async function sendTelegram(data, version) {
-  const buttons = data.slice(0, 10).map((d, i) => {
-    const dateMatch = d.date.match(/(\d+)年(\d+)月(\d+)日（(.)）/)
-    const shortDate = dateMatch
-      ? `${dateMatch[2]}.${dateMatch[3]}(${dateMatch[4]})`
-      : d.date
-
+  const buttons = data.slice(0, config.MAX_PUSH).map((d, i) => {
     return {
-      text: `🎾 ${d.court} ${shortDate} ${d.time}`,
+      text: `🎾 ${d.court} ${d.date} ${d.time}`,
       callback_data: `${version}_${i}`
     }
   })
 
-  const inline_keyboard = buttons.map(btn => [btn])
-
   await bot.sendMessage(
     process.env.CHAT_ID,
-    '发现可预约👇',
-    { reply_markup: { inline_keyboard } }
+    '🆕 可预约',
+    { reply_markup: { inline_keyboard: buttons.map(b => [b]) } }
   )
 }
 
+async function sendRemovedTelegram(data) {
+  const msg = data.slice(0, config.MAX_PUSH)
+    .map(d => `⚠️ 已被预约\n${d.court}\n${d.date}\n${d.time}`)
+    .join('\n\n')
+
+  await bot.sendMessage(process.env.CHAT_ID, msg)
+}
+
 // ========================
-// 点击预约
+// Telegram 控制
 // ========================
-bot.on('callback_query', async (query) => {
-  if (booking) return
+bot.onText(/\/config/, msg => {
+  bot.sendMessage(msg.chat.id, JSON.stringify(config, null, 2))
+})
 
-  const [version, indexStr] = query.data.split('_')
-  const index = Number(indexStr)
+bot.onText(/\/set (.+)/, (msg, match) => {
+  const [key, value] = match[1].split('=')
 
-  if (Number(version) !== currentVersion) return
-
-  const d = currentData[index]
-
-  booking = true
-  await bot.answerCallbackQuery(query.id, { text: '预约中...' })
-
-  try {
-    await bookOne(d)
-
-    await bot.sendMessage(
-      process.env.CHAT_ID,
-      `✅ 成功\n${d.court}\n${d.date}\n${d.time}`
-    )
-  } catch (e) {
-    await bot.sendMessage(
-      process.env.CHAT_ID,
-      `❌ 失败\n${e.message}`
-    )
+  if (config[key] === undefined) {
+    return bot.sendMessage(msg.chat.id, '❌ 参数不存在')
   }
 
-  booking = false
+  try {
+    config[key] = JSON.parse(value)
+  } catch {
+    config[key] = value
+  }
+
+  saveConfig()
+  bot.sendMessage(msg.chat.id, `✅ 已更新 ${key}`)
 })
 
 // ========================
-// 预约
-// ========================
 async function bookOne(d) {
-  const browser = await getBrowser()
-  const page = await browser.newPage()
-
-  await page.goto('https://reserve.city.ichikawa.lg.jp/')
-
-  await clickByText(page, 'スポーツ施設')
-  await clickByText(page, d.place)
-
-  await Promise.all([
-    page.waitForNavigation(),
-    page.click('#ucPCFooter_btnForward')
-  ])
-
-  await clickByText(page, '2週間')
-
-  await Promise.all([
-    page.waitForNavigation(),
-    page.click('#ucPCFooter_btnForward')
-  ])
-
-  await page.evaluate(() => {
-    document.querySelectorAll('table[id*="dgTable"] a').forEach(a => {
-      const val = a.innerText.replace(/\s/g, '')
-      if (val === '○' || val === '△') a.click()
-    })
-  })
-
-  await Promise.all([
-    page.waitForNavigation(),
-    page.click('#ucPCFooter_btnForward')
-  ])
-
-  await page.click(`#${d.id}`)
-
-  await Promise.all([
-    page.waitForNavigation(),
-    page.click('#ucPCFooter_btnForward')
-  ])
-
-  await handleLoginIfNeeded(page)
-  await clickApply(page)
+  console.log('🚀 自动预约:', d.court, d.time)
 }
 
 // ========================
-async function handleLoginIfNeeded(page) {
-  const btn = page.locator('#ucPCFooter_btnForward')
-
-  if (!(await btn.isVisible())) return
-
-  const value = await btn.inputValue()
-
-  if (!value.includes('ログイン')) return
-
-  await page.fill('#txtID', process.env.USER_ID)
-  await page.fill('#txtPass', process.env.PASSWORD)
-
-  await Promise.all([
-    page.waitForNavigation(),
-    btn.click()
-  ])
-}
-
-// ========================
-async function clickApply(page) {
-  const btn = page.locator('#ucPCFooter_btnForward')
-
-  const value = await btn.inputValue()
-
-  if (value.includes('申込')) {
-    await Promise.all([
-      page.waitForNavigation(),
-      btn.click()
-    ])
-  }
-}
-
-// ========================
+loadLastSet()
 monitor()
-setInterval(monitor, 3 * 60 * 1000)
+setInterval(monitor, config.INTERVAL * 1000)
