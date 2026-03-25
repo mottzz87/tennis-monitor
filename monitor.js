@@ -254,20 +254,54 @@ async function monitor() {
 // ========================
 // Telegram
 // ========================
+function formatText(d) {
+  // 场地名简化
+  let placeShort = d.place
+    .replace('テニスコート', '')
+    .replace('スポーツ広場', '')
+    .replace('中央公園', '中央')
+    .trim()
+
+  // 日期：2026年3月25日（水） → 3.25（水）
+  let shortDate = d.date
+  const dateMatch = d.date.match(/(\d+)年(\d+)月(\d+)日（(.)）/)
+  if (dateMatch) {
+    shortDate = `${dateMatch[2]}.${dateMatch[3]}（${dateMatch[4]}）`
+  }
+
+  // 时间：11:00～13:00 → 11:00~13:00
+  let shortTime = d.time.replace('～', '~')
+
+  return `${placeShort} ${d.court} ${shortDate} ${shortTime}`
+}
+
+// ========================
+// 新增推送
+// ========================
 async function sendTelegram(data, version) {
   const buttons = data.slice(0, config.MAX_PUSH).map((d, i) => ({
-    text: `🎾 ${d.court} ${d.date} ${d.time}`,
+    text: `🎾 ${formatText(d)}`,
     callback_data: `${version}_${i}`
   }))
 
-  await bot.sendMessage(process.env.CHAT_ID, '🆕 可预约', {
-    reply_markup: { inline_keyboard: buttons.map(b => [b]) }
-  })
+  await bot.sendMessage(
+    process.env.CHAT_ID,
+    '🆕 可预约（点击直接抢）',
+    {
+      reply_markup: {
+        inline_keyboard: buttons.map(b => [b])
+      }
+    }
+  )
 }
 
+// ========================
+// 减少推送
+// ========================
 async function sendRemovedTelegram(data) {
-  const msg = data.slice(0, config.MAX_PUSH)
-    .map(d => `⚠️ 已被预约\n${d.court}\n${d.date}\n${d.time}`)
+  const msg = data
+    .slice(0, config.MAX_PUSH)
+    .map(d => `⚠️ 已被预约\n${formatText(d)}`)
     .join('\n\n')
 
   await bot.sendMessage(process.env.CHAT_ID, msg)
