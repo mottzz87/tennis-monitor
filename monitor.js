@@ -184,13 +184,24 @@ async function clickApply(page) {
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true })
 
 bot.setMyCommands([
-  { command: 'run', description: '🚀 手动执行监控（强制推送）' },
-  { command: 'status', description: '📊 查看当前状态' },
+  { command: 'run', description: '🚀 执行监控（强制推送）' },
+  { command: 'status', description: '📊 查看系统状态' },
+
   { command: 'pause', description: '⏸️ 暂停监控' },
   { command: 'resume', description: '▶️ 恢复监控' },
+
+  // ❗ 全部改小写
+  { command: 'listplace', description: '📋 场地面板（开关控制）' },
+  { command: 'enableplace', description: '🟢 开启场地监控' },
+  { command: 'disableplace', description: '⚪ 关闭场地监控' },
+  { command: 'addplace', description: '➕ 添加新场地' },
+  { command: 'removeplace', description: '❌ 删除场地' },
+
   { command: 'config', description: '⚙️ 查看配置' },
-  { command: 'log', description: '📜 查看日志 /log 50' },
-  { command: 'help', description: '❓ 查看帮助' }
+  { command: 'set', description: '✏️ 修改配置' },
+
+  { command: 'log', description: '📜 查看日志（/log 50）' },
+  { command: 'help', description: '❓ 使用说明' }
 ])
 
 // ⭐ 管理员限制
@@ -520,7 +531,57 @@ async function bookOne(d, trace = createTrace()) {
 
 bot.on('callback_query', async (query) => {
   if (booking) return
+  const data = query.data
 
+  // ========================
+  // ⭐ 场地开关控制
+  // ========================
+  if (data.includes('|')) {
+    const [action, name] = data.split('|')
+
+    if (!config.PLACE_MAP[name]) {
+      return bot.answerCallbackQuery(query.id, { text: '❌ 场地不存在' })
+    }
+
+    if (action === 'enable') {
+      if (!config.TARGET_PLACE.includes(name)) {
+        config.TARGET_PLACE.push(name)
+        saveConfig()
+      }
+
+      await bot.answerCallbackQuery(query.id, { text: '✅ 已开启' })
+    }
+
+    if (action === 'disable') {
+      config.TARGET_PLACE = config.TARGET_PLACE.filter(p => p !== name)
+      saveConfig()
+
+      await bot.answerCallbackQuery(query.id, { text: '⏸️ 已关闭' })
+    }
+    await bot.editMessageReplyMarkup(
+      {
+        inline_keyboard: Object.entries(config.PLACE_MAP).map(([name, v]) => {
+          const enabled = config.TARGET_PLACE.includes(name)
+    
+          return [
+            {
+              text: `${enabled ? '🟢' : '⚪'} ${v.emoji} ${v.short}`,
+              callback_data: 'noop'
+            },
+            {
+              text: enabled ? '⏸️ 关闭' : '▶️ 开启',
+              callback_data: `${enabled ? 'disable' : 'enable'}|${name}`
+            }
+          ]
+        })
+      },
+      {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id
+      }
+    )
+    return
+  }
   const [version, indexStr] = query.data.split('_')
   if (Number(version) !== currentVersion) return
 
@@ -548,8 +609,6 @@ bot.on('callback_query', async (query) => {
 
   booking = false
 })
-
-
 
 // log
 bot.onText(/\/log(?: (\d+))?/, async (msg, match) => {
@@ -624,55 +683,163 @@ bot.onText(/\/resume/, async (msg) => {
 bot.onText(/\/status/, async (msg) => {
   if (!isAdmin(msg)) return
 
+  // ✅ 场地状态（动态计算）
+  const placeStatus = Object.entries(config.PLACE_MAP)
+    .map(([name, v]) => {
+      const enabled = config.TARGET_PLACE.includes(name)
+      return `${enabled ? '🟢' : '⚪'} ${v.emoji} ${v.short}`
+    })
+    .join('\n')
+
   const statusText = `
-    📊 *系统状态*
-    ━━━━━━━━━━━━━━
-    📡 监控状态：${!!timer ? '✅ 运行中' : '⏸️ 已暂停'}
-    🤖 预约状态：${booking ? '⏳ 预约中' : '🟢 空闲'}
+📊 *系统状态*
+━━━━━━━━━━━━━━
+📡 监控状态：${!!timer ? '✅ 运行中' : '⏸️ 已暂停'}
+🤖 预约状态：${booking ? '⏳ 预约中' : '🟢 空闲'}
 
-    📦 *数据情况*
-    ━━━━━━━━━━━━━━
-    📊 当前可预约：${currentData.length}
-    🆔 当前版本：${currentVersion}
+📦 *数据情况*
+━━━━━━━━━━━━━━
+📊 当前可预约：${currentData.length}
+🆔 当前版本：${currentVersion}
 
-    ⚙️ *运行配置*
-    ━━━━━━━━━━━━━━
-    ⏱️ 间隔：${config.INTERVAL}s
-    🎯 场地：${config.TARGET_PLACE.join(', ') || '全部'}
-    🕒 时间过滤：${config.TIME_FILTER.join(', ') || '不限'}
-    📅 星期过滤：${config.WEEKDAY_FILTER.join(', ') || '不限'}
+🏟️ *场地状态*
+━━━━━━━━━━━━━━
+${placeStatus || '暂无场地'}
 
-    🚀 *快捷操作*
-    ━━━━━━━━━━━━━━
-    /run ｜ /pause ｜ /resume
-    `
+⚙️ *运行配置*
+━━━━━━━━━━━━━━
+⏱️ 间隔：${config.INTERVAL}s
+🕒 时间过滤：${config.TIME_FILTER.join(', ') || '不限'}
+📅 星期过滤：${config.WEEKDAY_FILTER.join(', ') || '不限'}
+
+🚀 *快捷操作*
+━━━━━━━━━━━━━━
+/run ｜ /pause ｜ /resume
+`
 
   await bot.sendMessage(msg.chat.id, statusText, {
     parse_mode: 'Markdown'
   })
 })
+
+bot.onText(/\/addPlace (.+?) (.+?) (.+?) (.+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return
+
+  const [, name, short, emoji, bike] = match
+
+  // 1️⃣ 加入 TARGET_PLACE（避免重复）
+  if (!config.TARGET_PLACE.includes(name)) {
+    config.TARGET_PLACE.push(name)
+  }
+
+  // 2️⃣ 加入 PLACE_MAP
+  config.PLACE_MAP[name] = {
+    short,
+    emoji,
+    bike
+  }
+
+  saveConfig()
+
+  await bot.sendMessage(
+    msg.chat.id,
+    `✅ *已添加场地* ━━━━━━━━━━━━━━ ${emoji} ${short} 📍 ${name} 🚴 ${bike}`,
+    { parse_mode: 'Markdown' }
+  )
+})
+
+bot.onText(/\/listplace/, async (msg) => {
+  if (!isAdmin(msg)) return
+
+  const rows = Object.entries(config.PLACE_MAP).map(([name, v]) => {
+    const enabled = config.TARGET_PLACE.includes(name)
+
+    return [
+      {
+        text: `${enabled ? '🟢' : '⚪'} ${v.emoji} ${v.short}`,
+        callback_data: `noop`
+      },
+      {
+        text: enabled ? '⏸️ 关闭' : '▶️ 开启',
+        callback_data: `${enabled ? 'disable' : 'enable'}|${name}`
+      }
+    ]
+  })
+
+  await bot.sendMessage(
+    msg.chat.id,
+    `📍 *场地管理面板*
+━━━━━━━━━━━━━━
+点击右侧按钮即可开关监控
+
+🟢 = 监控中
+⚪ = 已关闭
+
+💡 提示：
+- 只影响监控，不会删除场地
+- 修改立即生效`,
+    {
+      parse_mode: 'Markdown',
+      reply_markup: {
+        inline_keyboard: rows
+      }
+    }
+  )
+})
+
+bot.onText(/\/removePlace (.+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return
+
+  const name = match[1].trim()
+
+  // 是否存在
+  if (!config.PLACE_MAP[name]) {
+    return bot.sendMessage(msg.chat.id, '❌ 场地不存在')
+  }
+
+  // 1️⃣ 从 TARGET_PLACE 删除
+  config.TARGET_PLACE = config.TARGET_PLACE.filter(p => p !== name)
+
+  // 2️⃣ 从 PLACE_MAP 删除
+  delete config.PLACE_MAP[name]
+
+  saveConfig()
+
+  await bot.sendMessage(
+    msg.chat.id,
+    `🗑️ *已删除场地* ━━━━━━━━━━━━━━ 📍 ${name}`,
+    { parse_mode: 'Markdown' }
+  )
+})
+
 // help
 bot.onText(/\/help/, async (msg) => {
   if (!isAdmin(msg)) return
 
   const helpText = `
-    🧠 *系统状态*
+    🧠 *系统控制台*
     ━━━━━━━━━━━━━━
-    📡 监控中：${!!timer ? '✅ 开启' : '❌ 关闭'}
-    🤖 预约中：${booking ? '⏳ 进行中' : '🟢 空闲'}
+    📡 当前状态：${!!timer ? '✅ 监控中' : '⏸️ 已暂停'}
+    🤖 预约状态：${booking ? '⏳ 执行中' : '🟢 空闲'}
 
-    🛠️ *基础命令*
+    🚀 *核心功能*
     ━━━━━━━━━━━━━━
-    🚀 /run       手动执行一次监控（强制推送）
-    📊 /status    查看当前状态
-    ❓ /help      查看帮助
+    /run         手动执行（强制推送）
+    /status      查看系统状态
+    /listPlace   场地管理面板（推荐⭐）
+
+    🏟️ *场地管理*
+    ━━━━━━━━━━━━━━
+    /listPlace   📋 打开可视化面板（推荐）
+    /enablePlace 🟢 开启场地监控
+    /disablePlace ⚪ 关闭场地监控
+    /addPlace    ➕ 添加新场地
+    /removePlace ❌ 删除场地
 
     ⚙️ *配置管理*
     ━━━━━━━━━━━━━━
-    📜 /config    查看当前配置
-
-    ✏️ /set key value
-    修改配置（支持 number / boolean / array）
+    /config      查看当前配置
+    /set key val 修改配置（支持 number / boolean / array）
 
     示例：
     /set INTERVAL 30
@@ -681,13 +848,19 @@ bot.onText(/\/help/, async (msg) => {
 
     📡 *监控控制*
     ━━━━━━━━━━━━━━
-    ⏸️ /pause     暂停监控
-    ▶️ /resume    恢复监控
+    /pause       ⏸️ 暂停监控
+    /resume      ▶️ 恢复监控
 
     📜 *日志*
     ━━━━━━━━━━━━━━
-    /log [n]      查看最近日志（默认20条）
+    /log [n]     查看最近日志（默认20条）
     例：/log 50
+
+    💡 *使用建议*
+    ━━━━━━━━━━━━━━
+    • ⭐ 推荐用 /listPlace 管理场地（可点击操作）
+    • 🚀 /run 可立即查看最新可预约
+    • 📊 /status 查看系统运行状态
     `
 
   await bot.sendMessage(msg.chat.id, helpText, {
@@ -701,6 +874,65 @@ bot.onText(/\/help/, async (msg) => {
       resize_keyboard: true
     }
   })
+})
+
+bot.onText(/\/enablePlace (.+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return
+
+  const name = match[1].trim()
+
+  // 必须存在于 PLACE_MAP
+  if (!config.PLACE_MAP[name]) {
+    return bot.sendMessage(msg.chat.id, '❌ 场地不存在（请先 addPlace）')
+  }
+
+  // 已经开启
+  if (config.TARGET_PLACE.includes(name)) {
+    return bot.sendMessage(msg.chat.id, '⚠️ 已经在监控中')
+  }
+
+  config.TARGET_PLACE.push(name)
+  saveConfig()
+
+  const meta = config.PLACE_MAP[name]
+
+  await bot.sendMessage(
+    msg.chat.id,
+    `✅ *已开启监控*
+━━━━━━━━━━━━━━
+${meta.emoji} ${meta.short}
+📍 ${name}`,
+    { parse_mode: 'Markdown' }
+  )
+})
+
+bot.onText(/\/disablePlace (.+)/, async (msg, match) => {
+  if (!isAdmin(msg)) return
+
+  const name = match[1].trim()
+
+  if (!config.PLACE_MAP[name]) {
+    return bot.sendMessage(msg.chat.id, '❌ 场地不存在')
+  }
+
+  // 已经关闭
+  if (!config.TARGET_PLACE.includes(name)) {
+    return bot.sendMessage(msg.chat.id, '⚠️ 本来就没在监控')
+  }
+
+  config.TARGET_PLACE = config.TARGET_PLACE.filter(p => p !== name)
+  saveConfig()
+
+  const meta = config.PLACE_MAP[name]
+
+  await bot.sendMessage(
+    msg.chat.id,
+    `⏸️ *已关闭监控*
+━━━━━━━━━━━━━━
+${meta.emoji} ${meta.short}
+📍 ${name}`,
+    { parse_mode: 'Markdown' }
+  )
 })
 
 // ========================
