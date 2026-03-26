@@ -19,21 +19,21 @@ module.exports = function registerTelegramHandlers({
   bot.setMyCommands([
     { command: 'run', description: '🚀 执行监控（强制推送）' },
     { command: 'status', description: '📊 查看系统状态' },
+    { command: 'listplace', description: '📋 场地面板（开关控制）' },
+
+    { command: 'config', description: '⚙️ 查看配置' },
+    { command: 'set', description: '✏️ 修改配置' },
+    { command: 'log', description: '📜 查看日志（/log 50）' },
 
     { command: 'pause', description: '⏸️ 暂停监控' },
     { command: 'resume', description: '▶️ 恢复监控' },
 
     // ❗ 全部改小写
-    { command: 'listplace', description: '📋 场地面板（开关控制）' },
     { command: 'enableplace', description: '🟢 开启场地监控' },
     { command: 'disableplace', description: '⚪ 关闭场地监控' },
     { command: 'addplace', description: '➕ 添加新场地' },
     { command: 'removeplace', description: '❌ 删除场地' },
 
-    { command: 'config', description: '⚙️ 查看配置' },
-    { command: 'set', description: '✏️ 修改配置' },
-
-    { command: 'log', description: '📜 查看日志（/log 50）' },
     { command: 'help', description: '❓ 使用说明' }
   ])
 
