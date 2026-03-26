@@ -171,7 +171,7 @@ async function monitor(options = {}) {
   try {
     logStep(trace, 'BROWSER', '启动浏览器')
     const browser = await chromium.launch({
-      headless: false,
+      headless: true,
       args: ['--no-sandbox']
     })
 
