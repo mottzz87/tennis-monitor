@@ -3,3 +3,4 @@ node_modules/
 cache.json
 logs/
 stats/
+lastSet.json
