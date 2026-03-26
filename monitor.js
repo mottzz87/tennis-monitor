@@ -2,6 +2,23 @@ require('dotenv').config()
 const fs = require('fs')
 const { chromium } = require('playwright')
 const TelegramBot = require('node-telegram-bot-api')
+const {
+  getLogFile,
+  setupConsoleLogging,
+  cleanOldLogs,
+  createTrace,
+  logStep
+} = require('./utils/logging')
+const { 
+  formatCourt,
+  filterSlotsByConfig,
+  filterSlotsAuto,
+  parseSlotDayKey,
+  parseSlotStartDateTime } = require('./utils/filters')
+const { sleep, clickByText } = require('./utils/runtime')
+const stats = require('./utils/stats')
+const registerTelegramHandlers = require('./utils/telegramHandlers')
+
 
 // ========================
 // 配置 & 状态
@@ -9,40 +26,16 @@ const TelegramBot = require('node-telegram-bot-api')
 const CONFIG_FILE = './config.json'
 const STATE_FILE = './lastSet.json'
 let logBuffer = []
-
-// ⭐ 劫持 console.log
-console._log = console.log
-console.log = (...args) => {
-  const msg = `[${new Date().toLocaleString()}] ` + args.join(' ')
-  console._log(...args)
-
-  logBuffer.push(msg)
-  if (logBuffer.length > 200) logBuffer.shift()
-
-  const logFile = getLogFile()
-
-  fs.mkdirSync('./logs', { recursive: true }) // 确保目录存在
-  fs.appendFileSync(logFile, msg + '\n')
-}
-
-function getLogFile() {
-  const date = new Date().toISOString().slice(0, 10) // 2026-03-26
-  return `./logs/runtime-${date}.log`
-}
-
-// ⭐ trace 工具
-function createTrace() {
-  return Math.random().toString(36).slice(2, 8)
-}
-
-function logStep(trace, step, msg, extra = '') {
-  console.log(`[${trace}] [${step}] ${msg}`, extra || '')
-}
+setupConsoleLogging(logBuffer)
 
 let config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'))
 
 function saveConfig() {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2))
+}
+
+function getDurationText(config) {
+  return config.BOOK_DURATION_MAP?.[config.BOOK_DURATION]
 }
 
 // ========================
@@ -60,44 +53,8 @@ function loadLastSet() {
   }
 }
 
-function formatCourt(court) {
-  if (!court) return ''
-
-  court = court.replace(/\u3000/g, ' ')
-  court = court.replace(/[０-９]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
-
-  const match = court.match(/第\s*(\d+)\s*コート/)
-  if (!match) return court
-
-  const num = match[1]
-  const prefix = court.split(/第\s*\d+\s*コート/)[0].trim()
-
-  return prefix ? `${prefix} c${num}` : `c${num}`
-}
-
 function saveLastSet() {
   fs.writeFileSync(STATE_FILE, JSON.stringify([...lastSet], null, 2))
-}
-
-function cleanOldLogs(days = 7) {
-  const dir = './logs'
-  if (!fs.existsSync(dir)) return
-
-  const files = fs.readdirSync(dir)
-  const now = Date.now()
-
-  files.forEach(file => {
-    const match = file.match(/runtime-(\d{4}-\d{2}-\d{2})\.log/)
-    if (!match) return
-
-    const fileDate = new Date(match[1]).getTime()
-    const diffDays = (now - fileDate) / (1000 * 60 * 60 * 24)
-
-    if (diffDays > days) {
-      fs.unlinkSync(`${dir}/${file}`)
-      console.log(`🧹 删除旧日志: ${file}`)
-    }
-  })
 }
 
 // ========================
@@ -122,7 +79,7 @@ function formatText(d, options = {}) {
   return `${emoji} ${placeShort} ${formatCourt(d.court)} ${shortDate} ${shortTime}${bike}`
 }
 
-async function sendTelegram(data, version) {
+async function sendTelegram(data, version, title = '🆕 可预约（点击直接预约）') {
   const buttons = data.slice(0, config.MAX_PUSH).map((d, i) => ({
     text: `${formatText(d)}`,
     callback_data: `${version}_${i}`
@@ -130,7 +87,7 @@ async function sendTelegram(data, version) {
 
   await bot.sendMessage(
     process.env.CHAT_ID,
-    '🆕 可预约（点击直接抢）',
+    title,
     {
       reply_markup: {
         inline_keyboard: buttons.map(b => [b])
@@ -183,27 +140,6 @@ async function clickApply(page) {
 // ========================
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true })
 
-bot.setMyCommands([
-  { command: 'run', description: '🚀 执行监控（强制推送）' },
-  { command: 'status', description: '📊 查看系统状态' },
-
-  { command: 'pause', description: '⏸️ 暂停监控' },
-  { command: 'resume', description: '▶️ 恢复监控' },
-
-  // ❗ 全部改小写
-  { command: 'listplace', description: '📋 场地面板（开关控制）' },
-  { command: 'enableplace', description: '🟢 开启场地监控' },
-  { command: 'disableplace', description: '⚪ 关闭场地监控' },
-  { command: 'addplace', description: '➕ 添加新场地' },
-  { command: 'removeplace', description: '❌ 删除场地' },
-
-  { command: 'config', description: '⚙️ 查看配置' },
-  { command: 'set', description: '✏️ 修改配置' },
-
-  { command: 'log', description: '📜 查看日志（/log 50）' },
-  { command: 'help', description: '❓ 使用说明' }
-])
-
 // ⭐ 管理员限制
 const ADMIN_ID = Number(process.env.CHAT_ID)
 function isAdmin(msg) {
@@ -212,44 +148,12 @@ function isAdmin(msg) {
 
 let currentData = []
 let currentVersion = 0
-let booking = false
+let booking = false //手动预约
+let autoBooking = false  //如AUTO_BOOT打开时，自动预约的状态机
+let autoBookedDayKeys = new Set() // 仅用于自动抢：同一天成功过就不再继续自动选
 let isFirstRun = true
 let timer = null
 
-function getKey(d) {
-  return `${d.place}_${d.court}_${d.date}_${d.time}`
-}
-
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms))
-}
-
-async function clickByText(page, text) {
-  await page.getByText(text, { exact: false }).first().click()
-}
-
-// ========================
-// 过滤器
-// ========================
-function filterData(data) {
-  return data.filter(d => {
-
-    if (config.TIME_FILTER.length > 0) {
-      if (!config.TIME_FILTER.some(t => d.time.includes(t))) return false
-    }
-
-    if (config.WEEKDAY_FILTER.length > 0) {
-      const match = d.date.match(/（(.)）/)
-      if (!match || !config.WEEKDAY_FILTER.includes(match[1])) return false
-    }
-
-    if (config.COURT_FILTER.length > 0) {
-      if (!config.COURT_FILTER.some(c => d.court.includes(c))) return false
-    }
-
-    return true
-  })
-}
 
 // ========================
 // 监控
@@ -267,7 +171,7 @@ async function monitor(options = {}) {
   try {
     logStep(trace, 'BROWSER', '启动浏览器')
     const browser = await chromium.launch({
-      headless: true,
+      headless: false,
       args: ['--no-sandbox']
     })
 
@@ -291,8 +195,8 @@ async function monitor(options = {}) {
       page.click('#ucPCFooter_btnForward')
     ])
 
-    logStep(trace, 'STEP', '进入2周视图')
-    await clickByText(page, '2週間')
+    logStep(trace, 'STEP', '进入表示期间选择')
+    await clickByText(page, getDurationText(config))
     await sleep(config.STEP_DELAY)
 
     await Promise.all([
@@ -302,9 +206,17 @@ async function monitor(options = {}) {
 
     logStep(trace, 'SCAN', '扫描空位按钮')
     await page.evaluate(() => {
+      let count = 0
+      const MAX = 10
+    
       document.querySelectorAll('table[id*="dgTable"] a').forEach(a => {
+        if (count >= MAX) return
+    
         const val = a.innerText.replace(/\s/g, '')
-        if (val === '○' || val === '△') a.click()
+        if (val === '○' || val === '△') {
+          a.click()
+          count++
+        }
       })
     })
 
@@ -348,12 +260,29 @@ async function monitor(options = {}) {
             const val = link.innerText.replace(/\s/g, '')
 
             if (val === '○' || val === '△') {
+              const dateStr = headers[0].innerText.replace(/\s/g, '')
+              const timeStr = times[j - 2]
+              const m = dateStr.match(/(\d+)年(\d+)月(\d+)日/)
+              if (m) {
+                const y = m[1]
+                const mo = String(m[2]).padStart(2, '0')
+                const d = String(m[3]).padStart(2, '0')
+                dateKey = `${y}-${mo}-${d}`
+              }
+              const formatStr = str => String(str)
+              .toLowerCase()
+              .replace(/\u3000/g, ' ')
+              .replace(/[０-９]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
+              .replace(/\s+/g, ' ')
+              .trim()
+
               result.push({
                 place: currentPlace,
-                court,
-                date: headers[0].innerText.replace(/\s/g, ''),
-                time: times[j - 2],
-                id: link.id
+                court: formatStr(court),
+                date: dateStr,
+                time: timeStr,
+                domId: link.id, // ⭐ 用于点击
+                uid: formatStr(`${currentPlace}_${court}_${dateKey}_${timeStr}`)
               })
             }
           }
@@ -365,9 +294,9 @@ async function monitor(options = {}) {
 
     logStep(trace, 'PARSE', `抓取数据: ${rawData.length}条`)
 
-    await browser.close()
+    // await browser.close()
 
-    const data = filterData(rawData)
+    const data = filterSlotsByConfig(rawData, config)
     currentData = data
     currentVersion = Date.now()
     logStep(trace, 'FILTER', `过滤后: ${data.length}条`)
@@ -378,7 +307,7 @@ async function monitor(options = {}) {
 
     console.log('可预约:', data.length)
 
-    const newSet = new Set(data.map(getKey))
+    const newSet = new Set(data.map(d => d.uid))
 
     if (isFirstRun) {
       isFirstRun = false
@@ -399,19 +328,22 @@ async function monitor(options = {}) {
         }
       }
 
-      lastSet = newSet
+      lastSet = new Set(data.map(d => d.uid))
       saveLastSet()
       return
     }
 
-    const added = data.filter(d => !lastSet.has(getKey(d)))
+    const added = data.filter(d => !lastSet.has(d.uid))
     const removed = [...lastSet]
-      .filter(k => !newSet.has(k))
-      .map(k => {
-        const [place, court, date, time] = k.split('_')
-        return { place, court, date, time }
-      })
-
+    .filter(k => !newSet.has(k))
+    .map(k => {
+      const [place, court, date, time] = k.split('_')
+      return { place, court, date, time }
+    })
+    .filter(d => config.TARGET_PLACE.includes(d.place)) // ⭐关键过滤
+    // ⭐ 统计埋点
+    stats.record('added', added)
+    stats.record('removed', removed)
     logStep(trace, 'DIFF', `新增:${added.length} 减少:${removed.length}`)
 
     if (added.length === 0 && removed.length === 0) {
@@ -422,7 +354,7 @@ async function monitor(options = {}) {
         currentVersion = Date.now()
     
         if (data.length > 0) {
-          await sendTelegram(data, currentVersion)
+          await sendTelegram(data, currentVersion, '✨ 有新场地！！点击直接预约）')
         } else {
           await bot.sendMessage(
             process.env.CHAT_ID,
@@ -436,20 +368,82 @@ async function monitor(options = {}) {
       return
     }
 
-    lastSet = newSet
+    lastSet = new Set(data.map(d => d.uid))
     saveLastSet()
 
-    if (added.length > 0 && config.NOTIFY_ADDED) {
-      logStep(trace, 'PUSH', `发送新增通知 ${added.length}`)
+    if (added.length > 0) {
+      // 先按“通知规则”处理 Telegram（如果你开了通知）
+      if (config.NOTIFY_ADDED) {
+        logStep(trace, 'PUSH', `发送新增通知 ${added.length}`)
 
-      currentData = added
-      currentVersion = Date.now()
+        currentData = added
+        currentVersion = Date.now()
 
-      await sendTelegram(added, currentVersion)
+        await sendTelegram(added, currentVersion)
+      }
 
-      if (config.AUTO_BOOK) {
-        logStep(trace, 'AUTO_BOOK', `尝试预约`)
-        await bookOne(added[0])
+      // 再按“自动抢规则”挑选最合适的 slot 去预约
+      if (config.AUTO_BOOK && !autoBooking) {
+        const autoCandidates = filterSlotsAuto(added, config)
+        if (autoCandidates.length === 0) {
+          logStep(trace, 'AUTO_BOOK', `无匹配项（added=${added.length}）`)
+        } else {
+          // 仅用于自动抢的附加规则：
+          // 1) 开始时间距离当前时间 < 20 分钟的筛掉
+          // 2) 当天若已自动抢成功过，则不再继续自动抢该天
+          const now = Date.now()
+
+          const candidates = autoCandidates.filter(d => {
+            const startDate = parseSlotStartDateTime(d)
+            if (!startDate) return false
+
+            const diffMin = (startDate.getTime() - now) / 60000
+            if (diffMin < 20) return false
+
+            const dayKey = parseSlotDayKey(d)
+            if (dayKey && autoBookedDayKeys.has(dayKey)) return false
+
+            return true
+          })
+
+          if (candidates.length === 0) {
+            logStep(trace, 'AUTO_BOOK', `筛选后无候选（added=${added.length}，auto=${autoCandidates.length}）`)
+          } else {
+            // 优先抢最晚开始的 slot
+            candidates.sort((a, b) => {
+              const ta = parseSlotStartDateTime(a)?.getTime() ?? -Infinity
+              const tb = parseSlotStartDateTime(b)?.getTime() ?? -Infinity
+              return tb - ta
+            })
+
+            const d = candidates[0]
+            const dayKey = parseSlotDayKey(d)
+
+            logStep(trace, 'AUTO_BOOK', `尝试预约（最晚且>=20min）${d.place} ${d.court} ${d.time}`)
+            autoBooking = true
+          try {
+            await bookOne(d)
+
+            await bot.sendMessage(
+              process.env.CHAT_ID,
+              `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatText(d, { showBike: true })}`,
+              { parse_mode: 'Markdown' }
+            )
+
+            if (dayKey) autoBookedDayKeys.add(dayKey)
+
+            await monitor({ forcePush: true })
+          } catch (e) {
+            await bot.sendMessage(
+              process.env.CHAT_ID,
+              `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatText(d)}\n\n🧨 ${e.message}`,
+              { parse_mode: 'Markdown' }
+            )
+          } finally {
+            autoBooking = false
+          }
+          }
+        }
       }
     }
 
@@ -491,8 +485,8 @@ async function bookOne(d, trace = createTrace()) {
     page.click('#ucPCFooter_btnForward')
   ])
 
-  logStep(trace, 'BOOK', '进入时间页')
-  await clickByText(page, '2週間')
+  logStep(trace, 'BOOK', '进入表示期间选择')
+  await clickByText(page, getDurationText(config))
   await sleep(config.STEP_DELAY)
 
   await Promise.all([
@@ -501,9 +495,17 @@ async function bookOne(d, trace = createTrace()) {
   ])
 
   await page.evaluate(() => {
+    let count = 0
+    const MAX = 10
+  
     document.querySelectorAll('table[id*="dgTable"] a').forEach(a => {
+      if (count >= MAX) return
+  
       const val = a.innerText.replace(/\s/g, '')
-      if (val === '○' || val === '△') a.click()
+      if (val === '○' || val === '△') {
+        a.click()
+        count++
+      }
     })
   })
 
@@ -513,7 +515,7 @@ async function bookOne(d, trace = createTrace()) {
   ])
 
   logStep(trace, 'BOOK', '点击目标slot')
-  await page.click(`#${d.id}`).catch(() => {})
+  await page.click(`#${d.domId}`).catch(() => {})
 
   await Promise.all([
     page.waitForNavigation({ waitUntil: 'networkidle' }),
@@ -529,415 +531,27 @@ async function bookOne(d, trace = createTrace()) {
   await browser.close()
 }
 
-bot.on('callback_query', async (query) => {
-  if (booking) return
-  const data = query.data
-
-  // ========================
-  // ⭐ 场地开关控制
-  // ========================
-  if (data.includes('|')) {
-    const [action, name] = data.split('|')
-
-    if (!config.PLACE_MAP[name]) {
-      return bot.answerCallbackQuery(query.id, { text: '❌ 场地不存在' })
-    }
-
-    if (action === 'enable') {
-      if (!config.TARGET_PLACE.includes(name)) {
-        config.TARGET_PLACE.push(name)
-        saveConfig()
-      }
-
-      await bot.answerCallbackQuery(query.id, { text: '✅ 已开启' })
-    }
-
-    if (action === 'disable') {
-      config.TARGET_PLACE = config.TARGET_PLACE.filter(p => p !== name)
-      saveConfig()
-
-      await bot.answerCallbackQuery(query.id, { text: '⏸️ 已关闭' })
-    }
-    await bot.editMessageReplyMarkup(
-      {
-        inline_keyboard: Object.entries(config.PLACE_MAP).map(([name, v]) => {
-          const enabled = config.TARGET_PLACE.includes(name)
-    
-          return [
-            {
-              text: `${enabled ? '🟢' : '⚪'} ${v.emoji} ${v.short}`,
-              callback_data: 'noop'
-            },
-            {
-              text: enabled ? '⏸️ 关闭' : '▶️ 开启',
-              callback_data: `${enabled ? 'disable' : 'enable'}|${name}`
-            }
-          ]
-        })
-      },
-      {
-        chat_id: query.message.chat.id,
-        message_id: query.message.message_id
-      }
-    )
-    return
-  }
-  const [version, indexStr] = query.data.split('_')
-  if (Number(version) !== currentVersion) return
-
-  const d = currentData[Number(indexStr)]
-
-  booking = true
-  await bot.answerCallbackQuery(query.id, { text: '预约中...' })
-
-  try {
-    await bookOne(d)
-
-    await bot.sendMessage(
-      process.env.CHAT_ID,
-      `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatText(d, { showBike: true })}`,
-      { parse_mode: 'Markdown' }
-    )
-    await monitor({ forcePush: true })
-  } catch (e) {
-    await bot.sendMessage(
-      process.env.CHAT_ID,
-      `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatText(d)}\n\n🧨 ${e.message}`,
-      { parse_mode: 'Markdown' }
-    )
-  }
-
-  booking = false
-})
-
-// log
-bot.onText(/\/log(?: (\d+))?/, async (msg, match) => {
-  if (!isAdmin(msg)) return
-  const MAX = 3500
-  const safeLogs = logBuffer.slice(-MAX)
-  const n = Number(match[1] || 20)
-  await bot.sendMessage(msg.chat.id, `📜 最近 ${n} 条日志：\n\n${safeLogs}`)
-})
-
-// config
-bot.onText(/\/config$/, async (msg) => {
-  if (!isAdmin(msg)) return
-  await bot.sendMessage(msg.chat.id, '⚙️ 当前配置：\n\n' + JSON.stringify(config, null, 2))
-})
-
-// set
-bot.onText(/\/set (\w+) (.+)/, async (msg, match) => {
-  if (!isAdmin(msg)) return
-
-  const key = match[1]
-  let value = match[2]
-
-  if (!(key in config)) {
-    return bot.sendMessage(msg.chat.id, '❌ 不存在这个配置项')
-  }
-
-  try {
-    if (value === 'true') value = true
-    else if (value === 'false') value = false
-    else if (!isNaN(value)) value = Number(value)
-    else if (value.startsWith('[')) value = JSON.parse(value)
-
-    config[key] = value
-    saveConfig()
-
-    await bot.sendMessage(msg.chat.id, `✅ 已更新 ${key}`)
-  } catch (e) {
-    await bot.sendMessage(msg.chat.id, `❌ 修改失败`)
-  }
-})
-
-// run
-bot.onText(/\/run/, async (msg) => {
-  if (!isAdmin(msg)) return
-  await bot.sendMessage(
-    msg.chat.id,
-    `🚀 *手动执行监控*\n━━━━━━━━━━━━━━\n⏳ 正在抓取最新数据...`,
-    { parse_mode: 'Markdown' }
-  )
-  await monitor({ forcePush: true })
-})
-
-// pause
-bot.onText(/\/pause/, async (msg) => {
-  if (!isAdmin(msg)) return
-  clearInterval(timer)
-  timer = null
-  await bot.sendMessage(msg.chat.id, '⏸️ *监控已暂停*\n━━━━━━━━━━━━━━\n不会再自动刷新')
-})
-
-// resume
-bot.onText(/\/resume/, async (msg) => {
-  if (!isAdmin(msg)) return
-  if (!timer) {
-    timer = setInterval(monitor, config.INTERVAL * 1000)
-  }
-  await bot.sendMessage(msg.chat.id, '监控已恢复*\n━━━━━━━━━━━━━━\n每 ${config.INTERVAL}s 执行一次')
-})
-
-// status
-bot.onText(/\/status/, async (msg) => {
-  if (!isAdmin(msg)) return
-
-  // ✅ 场地状态（动态计算）
-  const placeStatus = Object.entries(config.PLACE_MAP)
-    .map(([name, v]) => {
-      const enabled = config.TARGET_PLACE.includes(name)
-      return `${enabled ? '🟢' : '⚪'} ${v.emoji} ${v.short}`
-    })
-    .join('\n')
-
-  const statusText = `
-📊 *系统状态*
-━━━━━━━━━━━━━━
-📡 监控状态：${!!timer ? '✅ 运行中' : '⏸️ 已暂停'}
-🤖 预约状态：${booking ? '⏳ 预约中' : '🟢 空闲'}
-
-📦 *数据情况*
-━━━━━━━━━━━━━━
-📊 当前可预约：${currentData.length}
-🆔 当前版本：${currentVersion}
-
-🏟️ *场地状态*
-━━━━━━━━━━━━━━
-${placeStatus || '暂无场地'}
-
-⚙️ *运行配置*
-━━━━━━━━━━━━━━
-⏱️ 间隔：${config.INTERVAL}s
-🕒 时间过滤：${config.TIME_FILTER.join(', ') || '不限'}
-📅 星期过滤：${config.WEEKDAY_FILTER.join(', ') || '不限'}
-
-🚀 *快捷操作*
-━━━━━━━━━━━━━━
-/run ｜ /pause ｜ /resume
-`
-
-  await bot.sendMessage(msg.chat.id, statusText, {
-    parse_mode: 'Markdown'
-  })
-})
-
-bot.onText(/\/addPlace (.+?) (.+?) (.+?) (.+)/, async (msg, match) => {
-  if (!isAdmin(msg)) return
-
-  const [, name, short, emoji, bike] = match
-
-  // 1️⃣ 加入 TARGET_PLACE（避免重复）
-  if (!config.TARGET_PLACE.includes(name)) {
-    config.TARGET_PLACE.push(name)
-  }
-
-  // 2️⃣ 加入 PLACE_MAP
-  config.PLACE_MAP[name] = {
-    short,
-    emoji,
-    bike
-  }
-
-  saveConfig()
-
-  await bot.sendMessage(
-    msg.chat.id,
-    `✅ *已添加场地* ━━━━━━━━━━━━━━ ${emoji} ${short} 📍 ${name} 🚴 ${bike}`,
-    { parse_mode: 'Markdown' }
-  )
-})
-
-bot.onText(/\/listplace/, async (msg) => {
-  if (!isAdmin(msg)) return
-
-  const rows = Object.entries(config.PLACE_MAP).map(([name, v]) => {
-    const enabled = config.TARGET_PLACE.includes(name)
-
-    return [
-      {
-        text: `${enabled ? '🟢' : '⚪'} ${v.emoji} ${v.short}`,
-        callback_data: `noop`
-      },
-      {
-        text: enabled ? '⏸️ 关闭' : '▶️ 开启',
-        callback_data: `${enabled ? 'disable' : 'enable'}|${name}`
-      }
-    ]
-  })
-
-  await bot.sendMessage(
-    msg.chat.id,
-    `📍 *场地管理面板*
-━━━━━━━━━━━━━━
-点击右侧按钮即可开关监控
-
-🟢 = 监控中
-⚪ = 已关闭
-
-💡 提示：
-- 只影响监控，不会删除场地
-- 修改立即生效`,
-    {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        inline_keyboard: rows
-      }
-    }
-  )
-})
-
-bot.onText(/\/removePlace (.+)/, async (msg, match) => {
-  if (!isAdmin(msg)) return
-
-  const name = match[1].trim()
-
-  // 是否存在
-  if (!config.PLACE_MAP[name]) {
-    return bot.sendMessage(msg.chat.id, '❌ 场地不存在')
-  }
-
-  // 1️⃣ 从 TARGET_PLACE 删除
-  config.TARGET_PLACE = config.TARGET_PLACE.filter(p => p !== name)
-
-  // 2️⃣ 从 PLACE_MAP 删除
-  delete config.PLACE_MAP[name]
-
-  saveConfig()
-
-  await bot.sendMessage(
-    msg.chat.id,
-    `🗑️ *已删除场地* ━━━━━━━━━━━━━━ 📍 ${name}`,
-    { parse_mode: 'Markdown' }
-  )
-})
-
-// help
-bot.onText(/\/help/, async (msg) => {
-  if (!isAdmin(msg)) return
-
-  const helpText = `
-    🧠 *系统控制台*
-    ━━━━━━━━━━━━━━
-    📡 当前状态：${!!timer ? '✅ 监控中' : '⏸️ 已暂停'}
-    🤖 预约状态：${booking ? '⏳ 执行中' : '🟢 空闲'}
-
-    🚀 *核心功能*
-    ━━━━━━━━━━━━━━
-    /run         手动执行（强制推送）
-    /status      查看系统状态
-    /listPlace   场地管理面板（推荐⭐）
-
-    🏟️ *场地管理*
-    ━━━━━━━━━━━━━━
-    /listPlace   📋 打开可视化面板（推荐）
-    /enablePlace 🟢 开启场地监控
-    /disablePlace ⚪ 关闭场地监控
-    /addPlace    ➕ 添加新场地
-    /removePlace ❌ 删除场地
-
-    ⚙️ *配置管理*
-    ━━━━━━━━━━━━━━
-    /config      查看当前配置
-    /set key val 修改配置（支持 number / boolean / array）
-
-    示例：
-    /set INTERVAL 30
-    /set AUTO_BOOK false
-    /set TIME_FILTER ["18:00","19:00"]
-
-    📡 *监控控制*
-    ━━━━━━━━━━━━━━
-    /pause       ⏸️ 暂停监控
-    /resume      ▶️ 恢复监控
-
-    📜 *日志*
-    ━━━━━━━━━━━━━━
-    /log [n]     查看最近日志（默认20条）
-    例：/log 50
-
-    💡 *使用建议*
-    ━━━━━━━━━━━━━━
-    • ⭐ 推荐用 /listPlace 管理场地（可点击操作）
-    • 🚀 /run 可立即查看最新可预约
-    • 📊 /status 查看系统运行状态
-    `
-
-  await bot.sendMessage(msg.chat.id, helpText, {
-    parse_mode: 'Markdown',
-    reply_markup: {
-      keyboard: [
-        ['/run', '/status'],
-        ['/pause', '/resume'],
-        ['/config', '/log']
-      ],
-      resize_keyboard: true
-    }
-  })
-})
-
-bot.onText(/\/enablePlace (.+)/, async (msg, match) => {
-  if (!isAdmin(msg)) return
-
-  const name = match[1].trim()
-
-  // 必须存在于 PLACE_MAP
-  if (!config.PLACE_MAP[name]) {
-    return bot.sendMessage(msg.chat.id, '❌ 场地不存在（请先 addPlace）')
-  }
-
-  // 已经开启
-  if (config.TARGET_PLACE.includes(name)) {
-    return bot.sendMessage(msg.chat.id, '⚠️ 已经在监控中')
-  }
-
-  config.TARGET_PLACE.push(name)
-  saveConfig()
-
-  const meta = config.PLACE_MAP[name]
-
-  await bot.sendMessage(
-    msg.chat.id,
-    `✅ *已开启监控*
-━━━━━━━━━━━━━━
-${meta.emoji} ${meta.short}
-📍 ${name}`,
-    { parse_mode: 'Markdown' }
-  )
-})
-
-bot.onText(/\/disablePlace (.+)/, async (msg, match) => {
-  if (!isAdmin(msg)) return
-
-  const name = match[1].trim()
-
-  if (!config.PLACE_MAP[name]) {
-    return bot.sendMessage(msg.chat.id, '❌ 场地不存在')
-  }
-
-  // 已经关闭
-  if (!config.TARGET_PLACE.includes(name)) {
-    return bot.sendMessage(msg.chat.id, '⚠️ 本来就没在监控')
-  }
-
-  config.TARGET_PLACE = config.TARGET_PLACE.filter(p => p !== name)
-  saveConfig()
-
-  const meta = config.PLACE_MAP[name]
-
-  await bot.sendMessage(
-    msg.chat.id,
-    `⏸️ *已关闭监控*
-━━━━━━━━━━━━━━
-${meta.emoji} ${meta.short}
-📍 ${name}`,
-    { parse_mode: 'Markdown' }
-  )
+registerTelegramHandlers({
+  bot,
+  config,
+  isAdmin,
+  getCurrentData: () => currentData,
+  getCurrentVersion: () => currentVersion,
+  getBooking: () => booking,
+  setBooking: (v) => { booking = v },
+  getTimer: () => timer,
+  setTimer: (v) => { timer = v },
+  monitor,
+  bookOne,
+  formatText,
+  saveConfig,
+  getLogFile,
+  getLogBuffer: () => logBuffer
 })
 
 // ========================
 loadLastSet()
-cleanOldLogs()
+cleanOldLogs(30)
 monitor()
-timer = setInterval(monitor, config.INTERVAL * 1000)
-setInterval(() => cleanOldLogs(), 24 * 60 * 60 * 1000)
+timer = setInterval(monitor, Math.floor(Math.random() * (60) + config.INTERVAL) * 1000)
+setInterval(() => cleanOldLogs(30), 24 * 60 * 60 * 1000)
