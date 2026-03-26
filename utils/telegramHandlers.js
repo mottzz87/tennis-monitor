@@ -20,6 +20,7 @@ module.exports = function registerTelegramHandlers({
     { command: 'run', description: '🚀 执行监控（强制推送）' },
     { command: 'status', description: '📊 查看系统状态' },
     { command: 'listplace', description: '📋 场地面板（开关控制）' },
+    { command: 'stats', description: '👉 查看抢场统计' },
 
     { command: 'config', description: '⚙️ 查看配置' },
     { command: 'set', description: '✏️ 修改配置' },
