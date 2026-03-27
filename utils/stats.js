@@ -1,18 +1,40 @@
 const fs = require('fs')
+const path = require('path')
 
-const FILE = './stats.json'
-const DAYS = 30 // ⭐ 改这里：30天 or Infinity
+const DAYS = 30 // 统计窗口（天），Infinity 表示不限
 
-function loadStats() {
-  try {
-    return JSON.parse(fs.readFileSync(FILE, 'utf-8'))
-  } catch {
-    return { added: [], removed: [] }
+const LOG_ADDED = path.join('stats', 'added.log')
+const LOG_REMOVED = path.join('stats', 'removed.log')
+
+function readLogLines(filePath) {
+  if (!fs.existsSync(filePath)) return []
+  const raw = fs.readFileSync(filePath, 'utf-8')
+  const lines = raw.split('\n').map(l => l.trim()).filter(Boolean)
+  const out = []
+  for (const line of lines) {
+    try {
+      out.push(JSON.parse(line))
+    } catch {
+      // 跳过坏行
+    }
   }
+  return out
 }
 
-function saveStats(stats) {
-  fs.writeFileSync(FILE, JSON.stringify(stats, null, 2))
+function filterByWindow(list) {
+  if (DAYS === Infinity) return list
+  const cutoff = Date.now() - DAYS * 24 * 60 * 60 * 1000
+  return list.filter(i => typeof i.time === 'number' && i.time >= cutoff)
+}
+
+/**
+ * 从 append 的 log 加载；与 record() 写入的格式一致。
+ * （旧版 stats.json 若存在则忽略，以日志为准）
+ */
+function loadStats() {
+  const added = filterByWindow(readLogLines(LOG_ADDED))
+  const removed = filterByWindow(readLogLines(LOG_REMOVED))
+  return { added, removed }
 }
 
 // ========================
@@ -31,10 +53,10 @@ function record(type, list) {
     time: now,
     hour,
     place: d.place,
-    court: d.court, // ⭐ 新增
+    court: d.court,
     date: d.date,
     slot: d.time,
-    id: d.uid // ⭐ 用稳定ID
+    id: d.uid
   })).join('\n') + '\n'
 
   fs.appendFileSync(file, lines)
@@ -46,7 +68,9 @@ function record(type, list) {
 function groupByHour(list) {
   const map = {}
   list.forEach(i => {
-    map[i.hour] = (map[i.hour] || 0) + 1
+    const h = i.hour
+    if (h === undefined || h === null) return
+    map[h] = (map[h] || 0) + 1
   })
   return map
 }
@@ -54,19 +78,23 @@ function groupByHour(list) {
 function groupByPlace(list) {
   const map = {}
   list.forEach(i => {
-    map[i.place] = (map[i.place] || 0) + 1
+    const p = i.place || '（未知）'
+    map[p] = (map[p] || 0) + 1
   })
   return map
 }
 
 // ========================
-// ⚡ 速度分析（核心🔥）
+// ⚡ 速度分析：同一 slot（id）从「出现」到「消失」的间隔
 // ========================
 function calcSpeedBuckets(stats) {
   const addedMap = new Map()
-
   stats.added.forEach(a => {
-    addedMap.set(a.id, a.time)
+    if (!a.id) return
+    const t = a.time
+    if (!addedMap.has(a.id) || t < addedMap.get(a.id)) {
+      addedMap.set(a.id, t)
+    }
   })
 
   const buckets = {
@@ -80,29 +108,33 @@ function calcSpeedBuckets(stats) {
   }
 
   const placeBuckets = {}
+  const global = { ...buckets }
+
+  function bump(target, diffSec) {
+    if (diffSec <= 60) target['1m']++
+    else if (diffSec <= 180) target['3m']++
+    else if (diffSec <= 300) target['5m']++
+    else if (diffSec <= 600) target['10m']++
+    else if (diffSec <= 3600) target['1h']++
+    else if (diffSec <= 10800) target['3h']++
+    else target['3h+']++
+  }
 
   stats.removed.forEach(r => {
-    if (!addedMap.has(r.id)) return
+    if (!r.id || !addedMap.has(r.id)) return
 
-    const diff = (r.time - addedMap.get(r.id)) / 1000 // 秒
-    const p = r.place
+    const diff = (r.time - addedMap.get(r.id)) / 1000
+    if (diff < 0) return
 
+    const p = r.place || '（未知）'
     if (!placeBuckets[p]) {
-      placeBuckets[p] = JSON.parse(JSON.stringify(buckets))
+      placeBuckets[p] = { ...buckets }
     }
-
-    const target = placeBuckets[p]
-
-    if (diff <= 60) target['1m']++
-    else if (diff <= 180) target['3m']++
-    else if (diff <= 300) target['5m']++
-    else if (diff <= 600) target['10m']++
-    else if (diff <= 3600) target['1h']++
-    else if (diff <= 10800) target['3h']++
-    else target['3h+']++
+    bump(placeBuckets[p], diff)
+    bump(global, diff)
   })
 
-  return placeBuckets
+  return { byPlace: placeBuckets, global }
 }
 
 // ========================
@@ -116,7 +148,8 @@ function formatMap(map) {
 }
 
 function formatBucket(b) {
-  const total = Object.values(b).reduce((a, v) => a + v, 0) || 1
+  const total = Object.values(b).reduce((a, v) => a + v, 0)
+  if (total === 0) return '暂无配对样本（需同一 uid 先 added 再 removed）'
 
   return Object.entries(b)
     .map(([k, v]) => {
@@ -135,40 +168,32 @@ function buildReport() {
   const addedPlace = groupByPlace(stats.added)
   const removedPlace = groupByPlace(stats.removed)
 
-  const speed = calcSpeedBuckets(stats)
+  const { byPlace: speed, global: speedGlobal } = calcSpeedBuckets(stats)
 
   let speedText = ''
-
-  for (const place in speed) {
-    speedText += `
-🏟️ ${place}
-${formatBucket(speed[place])}
-`
+  const places = Object.keys(speed).sort()
+  for (const place of places) {
+    speedText += `\n🏟️ ${place}\n${formatBucket(speed[place])}`
   }
 
-  return `
-📊 *预约行为统计（最近${DAYS === Infinity ? '全部' : DAYS + '天'}）*
-━━━━━━━━━━━━━━
+  const windowLabel = DAYS === Infinity ? '全部' : `最近 ${DAYS} 天`
 
-🟢 *取消高峰（小时）*
-${formatMap(addedHour)}
-
-🔴 *被抢高峰（小时）*
-${formatMap(removedHour)}
-
-🏟️ *场地取消排行*
-${formatMap(addedPlace)}
-
-🏟️ *场地被抢排行*
-${formatMap(removedPlace)}
-
-⚡ *被抢速度分布（按场地）*
-${speedText || '暂无数据'}
-
-📈 样本：
-added=${stats.added.length}
-removed=${stats.removed.length}
-`
+  return (
+    `📊 抢场统计（${windowLabel}）\n` +
+    `━━━━━━━━━━━━━━\n\n` +
+    `🟢 空位出现时段（监控本地小时）\n` +
+    `${formatMap(addedHour)}\n\n` +
+    `🔴 空位消失时段（被约走）\n` +
+    `${formatMap(removedHour)}\n\n` +
+    `📍 出现次数 · 按场地\n` +
+    `${formatMap(addedPlace)}\n\n` +
+    `📍 消失次数 · 按场地\n` +
+    `${formatMap(removedPlace)}\n\n` +
+    `⚡ 从出现到消失（全局，需 uid 配对）\n` +
+    `${formatBucket(speedGlobal)}` +
+    `${speedText || ''}\n\n` +
+    `📈 样本条数 · added=${stats.added.length} · removed=${stats.removed.length}`
+  )
 }
 
 module.exports = {

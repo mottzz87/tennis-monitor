@@ -14,7 +14,9 @@ const {
   filterSlotsByConfig,
   filterSlotsAuto,
   parseSlotDayKey,
-  parseSlotStartDateTime } = require('./utils/filters')
+  parseSlotStartDateTimeSafe,
+  normalizeCourtAlias
+} = require('./utils/filters')
 const { sleep, clickByText } = require('./utils/runtime')
 const stats = require('./utils/stats')
 const registerTelegramHandlers = require('./utils/telegramHandlers')
@@ -25,6 +27,12 @@ const registerTelegramHandlers = require('./utils/telegramHandlers')
 // ========================
 const CONFIG_FILE = './config.json'
 const STATE_FILE = './lastSet.json'
+const BOOKED_FILE = './bookedSlots.json'
+const AUTO_BOOKED_FILE = './autoBooked.json'
+const REMINDER_INDEX_FILE = './reminderIndex.json'
+let bookedSlots = []
+let remindedSet = new Set() // 防止重复提醒
+let reminderIndex = {} // { [ucode]: [{ chatId, messageId }] }
 let logBuffer = []
 setupConsoleLogging(logBuffer)
 
@@ -36,6 +44,48 @@ function saveConfig() {
 
 function getDurationText(config) {
   return config.BOOK_DURATION_MAP?.[config.BOOK_DURATION]
+}
+
+function normalizeTimeRange(timeStr) {
+  const raw = String(timeStr || '')
+    .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+    .replace(/：/g, ':')
+    .replace(/～/g, '~')
+    .trim()
+
+  // already normalized like "11-13"
+  if (/^\d{1,2}-\d{1,2}$/.test(raw)) return raw
+
+  const [startRaw = '0', endRaw = '0'] = raw.split(/[~\-]/)
+  const toHour = (s) => {
+    const v = String(s || '').trim()
+    if (!v) return '0'
+    const h = Number(v.includes(':') ? v.split(':')[0] : v)
+    return Number.isNaN(h) ? '0' : String(h)
+  }
+
+  return `${toHour(startRaw)}-${toHour(endRaw)}`
+}
+
+function buildUcode(d) {
+  const placeMeta = config.PLACE_MAP?.[d.place] || {}
+  const placeCode = placeMeta.courtCode || 'unknown'
+  const courtCode = normalizeCourtAlias(d.court)
+  const dayKey = parseSlotDayKey(d) || d.date || 'unknown-date'
+  const timeRange = normalizeTimeRange(d.time)
+  return `${placeCode}_${courtCode}_${dayKey}_${timeRange}`
+}
+
+const WEEKDAY_JP = ['日', '月', '火', '水', '木', '金', '土']
+
+/** 展示用：m.dd（水），与 date(yyyy-mm-dd)、ucode 分离 */
+function formatDateDisplayFromIso(iso) {
+  const s = String(iso || '').trim()
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return ''
+  const [y, mo, d] = s.split('-').map(Number)
+  const dt = new Date(y, mo - 1, d)
+  const w = WEEKDAY_JP[dt.getDay()]
+  return `${mo}.${String(d).padStart(2, '0')}（${w}）`
 }
 
 // ========================
@@ -57,32 +107,300 @@ function saveLastSet() {
   fs.writeFileSync(STATE_FILE, JSON.stringify([...lastSet], null, 2))
 }
 
+function loadBookedSlots() {
+  try {
+    bookedSlots = JSON.parse(fs.readFileSync(BOOKED_FILE))
+    let changed = false
+    bookedSlots = bookedSlots.map(s => {
+      const date = parseSlotDayKey(s) || s.date
+      const time = normalizeTimeRange(s.time)
+      const ucode = s.ucode || buildUcode({ ...s, date, time })
+      const dateDisplay = s.dateDisplay || formatDateDisplayFromIso(date)
+      const reminderEnabled = s.reminderEnabled !== false
+      if (date !== s.date || time !== s.time || ucode !== s.ucode || dateDisplay !== s.dateDisplay) {
+        changed = true
+      }
+      if (reminderEnabled !== s.reminderEnabled && s.reminderEnabled !== undefined) changed = true
+      return { ...s, date, time, ucode, dateDisplay, reminderEnabled }
+    })
+    if (changed) saveBookedSlots()
+    console.log('✅ 已加载 bookedSlots')
+  } catch {
+    bookedSlots = []
+  }
+}
+
+function saveBookedSlots() {
+  fs.writeFileSync(BOOKED_FILE, JSON.stringify(bookedSlots, null, 2))
+}
+
+function loadReminderIndex() {
+  try {
+    reminderIndex = JSON.parse(fs.readFileSync(REMINDER_INDEX_FILE))
+  } catch {
+    reminderIndex = {}
+  }
+}
+
+function saveReminderIndex() {
+  fs.writeFileSync(REMINDER_INDEX_FILE, JSON.stringify(reminderIndex, null, 2))
+}
+
+function registerReminderMessage(ucode, chatId, messageId) {
+  if (!ucode || !chatId || !messageId) return
+  if (!reminderIndex[ucode]) reminderIndex[ucode] = []
+  reminderIndex[ucode].push({ chatId, messageId })
+  saveReminderIndex()
+}
+
+async function deleteReminderMessagesByUcode(ucode) {
+  const list = reminderIndex[ucode] || []
+  if (list.length === 0) return 0
+
+  const CONCURRENCY = 6
+  let deleted = 0
+
+  for (let i = 0; i < list.length; i += CONCURRENCY) {
+    const chunk = list.slice(i, i + CONCURRENCY)
+    const results = await Promise.allSettled(
+      chunk.map(item => bot.deleteMessage(item.chatId, String(item.messageId)))
+    )
+    deleted += results.filter(r => r.status === 'fulfilled').length
+  }
+
+  delete reminderIndex[ucode]
+  saveReminderIndex()
+  return deleted
+}
+
+// ✅ 添加预约
+function addBookedSlot(d) {
+  if (bookedSlots.some(s => s.uid === d.uid)) return
+  const date = parseSlotDayKey(d) || d.date
+  const time = normalizeTimeRange(d.time)
+  bookedSlots.push({
+    uid: d.uid,
+    place: d.place,
+    court: d.court,
+    date,
+    time,
+    dateDisplay: d.dateDisplay || formatDateDisplayFromIso(date),
+    ucode: buildUcode({ ...d, date, time }),
+    reminderEnabled: true,
+    create: new Date().toLocaleString()
+  })
+
+  saveBookedSlots()
+}
+
+// ❌ 删除预约
+function removeBookedSlot(key) {
+  const matched = bookedSlots.find(s => s.uid === key || s.ucode === key)
+  bookedSlots = bookedSlots.filter(s => s.uid !== key && s.ucode !== key)
+  saveBookedSlots()
+  remindedSet.delete(key) // ⭐ 防止残留
+  if (matched?.uid) remindedSet.delete(matched.uid)
+}
+
+function disableBookedReminder(key) {
+  let changed = false
+  let matchedUid = null
+
+  bookedSlots = bookedSlots.map(s => {
+    if (s.uid === key || s.ucode === key) {
+      changed = true
+      matchedUid = s.uid
+      return { ...s, reminderEnabled: false }
+    }
+    return s
+  })
+
+  if (changed) {
+    saveBookedSlots()
+    remindedSet.delete(key)
+    if (matchedUid) remindedSet.delete(matchedUid)
+  }
+  return changed
+}
+
+function getBookedSlots() {
+  return [...bookedSlots]
+}
+
+// ✅ 获取未来预约
+function getFutureBookedSlots() {
+  const now = Date.now()
+  return bookedSlots.filter(s => {
+    const start = parseSlotStartDateTimeSafe(s)
+    return start && start.getTime() > now
+  })
+}
+
+// 🧹 清理过期
+function cleanExpiredBooked() {
+  const now = Date.now()
+
+  bookedSlots = bookedSlots.filter(s => {
+    const start = parseSlotStartDateTimeSafe(s)
+    return start && start.getTime() > now
+  })
+
+  saveBookedSlots()
+}
+
+function loadAutoBooked() {
+  try {
+    const arr = JSON.parse(fs.readFileSync(AUTO_BOOKED_FILE))
+    autoBookedUIDs = new Set(arr)
+  } catch {
+    autoBookedUIDs = new Set()
+  }
+}
+
+function saveAutoBooked() {
+  fs.writeFileSync(AUTO_BOOKED_FILE, JSON.stringify([...autoBookedUIDs], null, 2))
+}
+
 // ========================
 // Telegram 原有
 // ========================
+function formatTimeDisplay(time) {
+  const raw = String(time || '').trim()
+  const m = raw.match(/^(\d{1,2})-(\d{1,2})$/)
+  if (m) return `${String(m[1]).padStart(2, '0')}:00–${String(m[2]).padStart(2, '0')}:00`
+  return raw.replace('~', '–')
+}
+
 function formatText(d, options = {}) {
-  const { showBike = false } = options
+  const { showBike = false, style = 'compact' } = options
 
   const meta = config.PLACE_MAP[d.place] || {}
   const placeShort = meta.short || d.place
   const emoji = meta.emoji || '🎾'
   const bike = showBike && meta.bike ? ` ${meta.bike}` : ''
+  const courtDisplay = String(formatCourt(d.court) || '').toUpperCase()
 
-  let shortDate = d.date
-  const dateMatch = d.date.match(/(\d+)年(\d+)月(\d+)日（(.)）/)
-  if (dateMatch) {
-    shortDate = `${dateMatch[2]}.${dateMatch[3]}（${dateMatch[4]}）`
+  let shortDate = d.dateDisplay
+  if (!shortDate && /^\d{4}-\d{2}-\d{2}$/.test(String(d.date || '').trim())) {
+    shortDate = formatDateDisplayFromIso(d.date)
+  }
+  if (!shortDate) {
+    const dateMatch = String(d.date || '').match(/(\d+)年(\d+)月(\d+)日（(.)）/)
+    if (dateMatch) {
+      shortDate = `${dateMatch[2]}.${dateMatch[3]}（${dateMatch[4]}）`
+    } else {
+      shortDate = d.date
+    }
   }
 
-  let shortTime = d.time.replace('～', '~')
+  const shortTime = formatTimeDisplay(d.time)
+
+  if (style === 'detail') {
+    return `${emoji} ${placeShort}｜${courtDisplay}\n📅 ${shortDate} ⏰ ${shortTime}${bike}`
+  }
 
   return `${emoji} ${placeShort} ${formatCourt(d.court)} ${shortDate} ${shortTime}${bike}`
+}
+
+async function pushBookedReminder() {
+  const future = getFutureBookedSlots().filter(s => s.reminderEnabled !== false)
+
+  if (future.length === 0) return
+
+  // ========================
+  // ⭐ 按天分组
+  // ========================
+  const grouped = new Map()
+
+  for (const d of future) {
+    const dayKey = d.date // yyyy-mm-dd
+
+    if (!grouped.has(dayKey)) grouped.set(dayKey, [])
+    grouped.get(dayKey).push(d)
+  }
+
+  // ========================
+  // ⭐ 每天一条消息
+  // ========================
+  for (const [dayKey, list] of grouped.entries()) {
+
+    // 按时间排序
+    list.sort((a, b) => {
+      const ta = parseSlotStartDateTimeSafe(a)?.getTime() ?? 0
+      const tb = parseSlotStartDateTimeSafe(b)?.getTime() ?? 0
+      return ta - tb
+    })
+
+    const text = list
+      .map(d => `• ${formatText(d)}`)
+      .join('\n')
+
+    // 👉 每条都带删除按钮
+    const buttons = list.map(d => ([
+      {
+        text: `❌ 取消 ${d.dateDisplay || formatDateDisplayFromIso(dayKey)} ${formatTimeDisplay(d.time)}`,
+        callback_data: `del_booked_${d.ucode}`
+      }
+    ]))
+
+    const dayTitle = list[0].dateDisplay || formatDateDisplayFromIso(dayKey) || dayKey
+    const sent = await bot.sendMessage(
+      process.env.CHAT_ID,
+      `📅 *已预约提醒（${dayTitle}）*\n━━━━━━━━━━━━━━\n${text}`,
+      {
+        parse_mode: 'Markdown',
+        reply_markup: {
+          inline_keyboard: buttons
+        }
+      }
+    )
+    for (const d of list) {
+      registerReminderMessage(d.ucode, sent.chat.id, sent.message_id)
+    }
+  }
+}
+
+async function pushUpcomingReminder() {
+  const future = getFutureBookedSlots().filter(s => s.reminderEnabled !== false)
+  const now = Date.now()
+
+  for (const d of future) {
+    const start = parseSlotStartDateTimeSafe(d)
+    if (!start) continue
+
+    const diffMin = (start.getTime() - now) / 60000
+
+    // ✅ 触发条件：0~60分钟
+    if (diffMin > 0 && diffMin <= 60) {
+
+      if (remindedSet.has(d.uid)) continue // 防重复
+
+      remindedSet.add(d.uid)
+
+      const sent = await bot.sendMessage(
+        process.env.CHAT_ID,
+        `⏰ *即将开始（1小时内）*\n━━━━━━━━━━━━━━\n${formatText(d)}`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [[
+              {
+                text: `❌ 取消 ${d.dateDisplay || formatDateDisplayFromIso(d.date)} ${formatTimeDisplay(d.time)}`,
+                callback_data: `del_booked_${d.ucode}`
+              }
+            ]]
+          }
+        }
+      )
+      registerReminderMessage(d.ucode, sent.chat.id, sent.message_id)
+    }
+  }
 }
 
 async function sendTelegram(data, version, title = '🆕 可预约（点击直接预约）') {
   const buttons = data.slice(0, config.MAX_PUSH).map((d, i) => ({
     text: `${formatText(d)}`,
-    callback_data: `${version}_${i}`
+    callback_data: `book_${d.ucode}`
   }))
 
   await bot.sendMessage(
@@ -151,8 +469,25 @@ let currentVersion = 0
 let booking = false //手动预约
 let autoBooking = false  //如AUTO_BOOT打开时，自动预约的状态机
 let autoBookedDayKeys = new Set() // 仅用于自动抢：同一天成功过就不再继续自动选
+let autoBookedUIDs = new Set()
 let isFirstRun = true
 let timer = null
+let lastBookedReminderAt = 0
+
+function getBookedReminderIntervalMs() {
+  const hours = Number(config.BOOKED_REMINDER_INTERVAL_HOURS)
+  if (Number.isFinite(hours) && hours > 0) {
+    return Math.floor(hours * 60 * 60 * 1000)
+  }
+  return 2 * 60 * 60 * 1000
+}
+
+async function pushBookedReminderBySchedule() {
+  const now = Date.now()
+  if (now - lastBookedReminderAt < getBookedReminderIntervalMs()) return
+  await pushBookedReminder()
+  lastBookedReminderAt = now
+}
 
 
 // ========================
@@ -167,10 +502,10 @@ async function monitor(options = {}) {
     logStep(trace, 'SKIP', '正在预约，跳过')
     return
   }
-
+  let browser
   try {
     logStep(trace, 'BROWSER', '启动浏览器')
-    const browser = await chromium.launch({
+    browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox']
     })
@@ -205,20 +540,91 @@ async function monitor(options = {}) {
     ])
 
     logStep(trace, 'SCAN', '扫描空位按钮')
-    await page.evaluate(() => {
+    await page.evaluate((autoWeekdays) => {
       let count = 0
       const MAX = 10
     
-      document.querySelectorAll('table[id*="dgTable"] a').forEach(a => {
-        if (count >= MAX) return
+      const weekdayMap = {
+        '日': 0,
+        '月': 1,
+        '火': 2,
+        '水': 3,
+        '木': 4,
+        '金': 5,
+        '土': 6
+      }
     
-        const val = a.innerText.replace(/\s/g, '')
-        if (val === '○' || val === '△') {
-          a.click()
-          count++
+      const preferred = autoWeekdays.map(w => weekdayMap[w])
+    
+      const tables = document.querySelectorAll('table[id*="dgTable"]')
+    
+      const candidates = []
+    
+      // ========================
+      // ⭐ 收集所有可点击 slot + 对应星期
+      // ========================
+      tables.forEach(table => {
+        const rows = table.querySelectorAll('tr')
+        if (rows.length === 0) return
+    
+        const headers = rows[0].querySelectorAll('td')
+    
+        // 每一列对应一个日期（含星期）
+        const colWeekdays = []
+    
+        for (let i = 2; i < headers.length; i++) {
+          const text = headers[i].innerText.replace(/\s/g, '')
+          const m = text.match(/（(.)）/)
+          colWeekdays.push(m ? m[1] : null)
+        }
+    
+        // 遍历格子
+        for (let i = 1; i < rows.length; i++) {
+          const tds = rows[i].querySelectorAll('td')
+    
+          for (let j = 2; j < tds.length; j++) {
+            const link = tds[j].querySelector('a')
+            if (!link) continue
+    
+            const val = link.innerText.replace(/\s/g, '')
+            if (val !== '○' && val !== '△') continue
+    
+            const weekday = colWeekdays[j - 2]
+    
+            candidates.push({
+              el: link,
+              weekday,
+            })
+          }
         }
       })
-    })
+    
+      // ========================
+      // ⭐ 1️⃣ 先选 AUTO_WEEKDAY
+      // ========================
+      for (const c of candidates) {
+        if (count >= MAX) break
+    
+        const wd = weekdayMap[c.weekday]
+        if (preferred.includes(wd)) {
+          c.el.click()
+          c.el.dataset.selected = '1'
+          count++
+        }
+      }
+    
+      // ========================
+      // ⭐ 2️⃣ 再补剩余
+      // ========================
+      for (const c of candidates) {
+        if (count >= MAX) break
+        if (c.el.dataset.selected) continue
+    
+        c.el.click()
+        count++
+      }
+    
+    }, config.AUTO_WEEKDAY_FILTER || [])
 
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'networkidle' }),
@@ -260,29 +666,51 @@ async function monitor(options = {}) {
             const val = link.innerText.replace(/\s/g, '')
 
             if (val === '○' || val === '△') {
-              const dateStr = headers[0].innerText.replace(/\s/g, '')
-              const timeStr = times[j - 2]
-              const m = dateStr.match(/(\d+)年(\d+)月(\d+)日/)
-              if (m) {
-                const y = m[1]
-                const mo = String(m[2]).padStart(2, '0')
-                const d = String(m[3]).padStart(2, '0')
-                dateKey = `${y}-${mo}-${d}`
-              }
+              const rawDate = headers[0].innerText.replace(/\s/g, '');
+              const rawTime = times[j - 2];
               const formatStr = str => String(str)
               .toLowerCase()
               .replace(/\u3000/g, ' ')
               .replace(/[０-９]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
               .replace(/\s+/g, ' ')
               .trim()
+              // 统一格式
+              const dateMatch = rawDate.match(/(\d+)年(\d+)月(\d+)日/);
+              let dateFormatted = rawDate;
+              let dateDisplay = '';
+              if (dateMatch) {
+                const y = dateMatch[1];
+                const mo = String(dateMatch[2]).padStart(2, '0');
+                const d = String(dateMatch[3]).padStart(2, '0');
+                dateFormatted = `${y}-${mo}-${d}`; // YYYY-MM-DD
+                const moNum = Number(dateMatch[2]);
+                const dday = String(dateMatch[3]).padStart(2, '0');
+                const wdMatch = rawDate.match(/（([月火水木金土日])）/);
+                dateDisplay = wdMatch
+                  ? `${moNum}.${dday}（${wdMatch[1]}）`
+                  : `${moNum}.${dday}`;
+              }
 
+              const normalized = rawTime
+                .replace(/[０-９]/g, s => String.fromCharCode(s.charCodeAt(0) - 0xFEE0))
+                .replace(/：/g, ':')
+                .replace(/～/g, '~')
+                .trim();
+              const [startRaw = '0', endRaw = '0'] = normalized.split('~');
+              const toHour = (s) => {
+                const t = String(s || '').trim();
+                const h = Number(t.includes(':') ? t.split(':')[0] : t);
+                return Number.isNaN(h) ? '0' : String(h);
+              };
+              const timeFormatted = `${toHour(startRaw)}-${toHour(endRaw)}`; // 13-15
               result.push({
                 place: currentPlace,
                 court: formatStr(court),
-                date: dateStr,
-                time: timeStr,
+                date: dateFormatted,
+                time: timeFormatted,
+                dateDisplay,
                 domId: link.id, // ⭐ 用于点击
-                uid: formatStr(`${currentPlace}_${court}_${dateKey}_${timeStr}`)
+                uid: formatStr(`${currentPlace}_${court}_${dateFormatted}_${timeFormatted}`)
               })
             }
           }
@@ -294,9 +722,18 @@ async function monitor(options = {}) {
 
     logStep(trace, 'PARSE', `抓取数据: ${rawData.length}条`)
 
-    await browser.close()
+    // await browser.close()
 
-    const data = filterSlotsByConfig(rawData, config)
+    const sourceData = rawData.map(d => {
+      const date = parseSlotDayKey(d) || d.date
+      const time = normalizeTimeRange(d.time)
+      const dateDisplay = d.dateDisplay || formatDateDisplayFromIso(date)
+      return { ...d, date, time, dateDisplay }
+    })
+    const data = filterSlotsByConfig(
+      sourceData.map(d => ({ ...d, ucode: buildUcode(d) })),
+      config
+    )
     currentData = data
     currentVersion = Date.now()
     logStep(trace, 'FILTER', `过滤后: ${data.length}条`)
@@ -316,7 +753,6 @@ async function monitor(options = {}) {
       if (config.PUSH_ON_INIT) {
         currentData = data
         currentVersion = Date.now()
-
         if (data.length > 0) {
           await sendTelegram(data, currentVersion)
         } else {
@@ -330,6 +766,7 @@ async function monitor(options = {}) {
 
       lastSet = new Set(data.map(d => d.uid))
       saveLastSet()
+
       return
     }
 
@@ -354,7 +791,7 @@ async function monitor(options = {}) {
         currentVersion = Date.now()
     
         if (data.length > 0) {
-          await sendTelegram(data, currentVersion, '✨ 有新场地！！点击直接预约）')
+          await sendTelegram(data, currentVersion)
         } else {
           await bot.sendMessage(
             process.env.CHAT_ID,
@@ -379,69 +816,157 @@ async function monitor(options = {}) {
         currentData = added
         currentVersion = Date.now()
 
-        await sendTelegram(added, currentVersion)
+        await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约')
       }
 
       // 再按“自动抢规则”挑选最合适的 slot 去预约
       if (config.AUTO_BOOK && !autoBooking) {
         const autoCandidates = filterSlotsAuto(added, config)
+
         if (autoCandidates.length === 0) {
           logStep(trace, 'AUTO_BOOK', `无匹配项（added=${added.length}）`)
         } else {
-          // 仅用于自动抢的附加规则：
-          // 1) 开始时间距离当前时间 < 20 分钟的筛掉
-          // 2) 当天若已自动抢成功过，则不再继续自动抢该天
           const now = Date.now()
 
+          // ✅ 基础过滤
           const candidates = autoCandidates.filter(d => {
-            const startDate = parseSlotStartDateTime(d)
+            const startDate = parseSlotStartDateTimeSafe(d)
             if (!startDate) return false
-
+          
+            const now = Date.now()
             const diffMin = (startDate.getTime() - now) / 60000
+          
+            // ❌ 太近的不抢
             if (diffMin < 20) return false
-
+          
             const dayKey = parseSlotDayKey(d)
+          
+            // ❌ 已经抢过这一天（你原有逻辑）
             if (dayKey && autoBookedDayKeys.has(dayKey)) return false
-
+          
+            // ❌ ⭐ 已经抢过这个 slot（新增核心）
+            if (autoBookedUIDs.has(d.uid)) return false
+          
             return true
           })
 
           if (candidates.length === 0) {
             logStep(trace, 'AUTO_BOOK', `筛选后无候选（added=${added.length}，auto=${autoCandidates.length}）`)
           } else {
-            // 优先抢最晚开始的 slot
-            candidates.sort((a, b) => {
-              const ta = parseSlotStartDateTime(a)?.getTime() ?? -Infinity
-              const tb = parseSlotStartDateTime(b)?.getTime() ?? -Infinity
-              return tb - ta
-            })
 
-            const d = candidates[0]
-            const dayKey = parseSlotDayKey(d)
+            // ========================
+            // ⭐ 按天分组
+            // ========================
+            const grouped = new Map()
 
-            logStep(trace, 'AUTO_BOOK', `尝试预约（最晚且>=20min）${d.place} ${d.court} ${d.time}`)
+            for (const d of candidates) {
+              const dayKey = parseSlotDayKey(d)
+              if (!dayKey) continue
+
+              if (!grouped.has(dayKey)) grouped.set(dayKey, [])
+              grouped.get(dayKey).push(d)
+            }
+
+            // ========================
+            // ⭐ 每天选最晚一个
+            // ========================
+            const targets = []
+
+            for (const [dayKey, list] of grouped.entries()) {
+              list.sort((a, b) => {
+                const ta = parseSlotStartDateTimeSafe(a)?.getTime() ?? -Infinity
+                const tb = parseSlotStartDateTimeSafe(b)?.getTime() ?? -Infinity
+                return tb - ta
+              })
+
+              const best = list[0]
+              targets.push(best)
+            }
+
+            if (targets.length === 0) {
+              logStep(trace, 'AUTO_BOOK', '分组后无目标')
+              return
+            }
+
+            logStep(
+              trace,
+              'AUTO_BOOK',
+              `准备一次性预约 ${targets.length} 个：` +
+              targets.map(d => `${d.place} ${d.time}`).join(' | ')
+            )
+
             autoBooking = true
-          try {
-            await bookOne(d)
 
-            await bot.sendMessage(
-              process.env.CHAT_ID,
-              `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatText(d, { showBike: true })}`,
-              { parse_mode: 'Markdown' }
-            )
+            try {
+              // ========================
+              // ⭐ 一次性点击多个 slot
+              // ========================
+              await Promise.all(
+                targets.map(async d => {
+                  logStep(trace, 'AUTO_BOOK', `选中 ${d.place} ${d.time}`)
+                  try {
+                    await page.click(`#${d.domId}`)
+                  } catch (e) {
+                    logStep(trace, 'AUTO_BOOK_CLICK_FAIL', `${d.domId}`)
+                    throw e
+                  }
+                })
+              )
 
-            if (dayKey) autoBookedDayKeys.add(dayKey)
+              // ========================
+              // ⭐ 一次提交
+              // ========================
+              await Promise.all([
+                page.waitForNavigation({ waitUntil: 'networkidle' }),
+                page.click('#ucPCFooter_btnForward')
+              ])
 
-            await monitor({ forcePush: true })
-          } catch (e) {
-            await bot.sendMessage(
-              process.env.CHAT_ID,
-              `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatText(d)}\n\n🧨 ${e.message}`,
-              { parse_mode: 'Markdown' }
-            )
-          } finally {
-            autoBooking = false
-          }
+              // await handleLoginIfNeeded(page)
+              // await clickApply(page)
+
+              // ========================
+              // ⭐ 标记已预约的日期
+              // ========================
+              for (const d of targets) {
+                const dayKey = parseSlotDayKey(d)
+              
+                addBookedSlot(d)
+              
+                if (dayKey) autoBookedDayKeys.add(dayKey)
+              
+                // ⭐ 标记这个 slot 已经抢过
+                autoBookedUIDs.add(d.uid)
+                saveAutoBooked()
+              }
+
+              // ========================
+              // ⭐ 通知
+              // ========================
+              await bot.sendMessage(
+                process.env.CHAT_ID,
+                `🎉 *自动预约成功（多场）！*\n━━━━━━━━━━━━━━\n` +
+                targets.map(d => formatText(d, { showBike: true, style: 'detail' })).join('\n\n'),
+                { parse_mode: 'Markdown' }
+              )
+
+              setTimeout(() => monitor({ forcePush: true }), 1000)
+
+            } catch (e) {
+              // ⭐ 防止失败反复抢同一个 slot
+              for (const d of targets) {
+                autoBookedUIDs.add(d.uid)
+              }
+
+              await bot.sendMessage(
+                process.env.CHAT_ID,
+                `❌ *自动预约失败（多场）*\n━━━━━━━━━━━━━━\n` +
+                targets.map(d => formatText(d, { style: 'detail' })).join('\n\n') +
+                `\n\n🧨 ${e.message}`,
+                { parse_mode: 'Markdown' }
+              )
+            } finally {
+              autoBooking = false
+            }
           }
         }
       }
@@ -454,6 +979,8 @@ async function monitor(options = {}) {
 
   } catch (e) {
     console.log(`[${trace}] ❌ monitor错误:`, e.stack || e.message)
+  }finally {
+    if (browser) await browser.close()
   }
 }
 
@@ -493,21 +1020,98 @@ async function bookOne(d, trace = createTrace()) {
     page.waitForNavigation({ waitUntil: 'networkidle' }),
     page.click('#ucPCFooter_btnForward')
   ])
-
-  await page.evaluate(() => {
+  // ========================
+  // ✅ 优先点击 AUTO_WEEKDAY_FILTER（比如 土日）
+  // ✅ 不够 10 个 → 再补其他
+  // ✅ 不影响 monitor 全量扫描能力
+  // ========================
+  await page.evaluate((autoWeekdays) => {
     let count = 0
     const MAX = 10
   
-    document.querySelectorAll('table[id*="dgTable"] a').forEach(a => {
-      if (count >= MAX) return
+    const weekdayMap = {
+      '日': 0,
+      '月': 1,
+      '火': 2,
+      '水': 3,
+      '木': 4,
+      '金': 5,
+      '土': 6
+    }
   
-      const val = a.innerText.replace(/\s/g, '')
-      if (val === '○' || val === '△') {
-        a.click()
-        count++
+    const preferred = autoWeekdays.map(w => weekdayMap[w])
+  
+    const tables = document.querySelectorAll('table[id*="dgTable"]')
+  
+    const candidates = []
+
+    // ========================
+    // ⭐ 收集所有可点击 slot + 对应星期
+    // ========================
+    tables.forEach(table => {
+      const rows = table.querySelectorAll('tr')
+      if (rows.length === 0) return
+  
+      const headers = rows[0].querySelectorAll('td')
+  
+      // 每一列对应一个日期（含星期）
+      const colWeekdays = []
+  
+      for (let i = 2; i < headers.length; i++) {
+        const text = headers[i].innerText.replace(/\s/g, '')
+        const m = text.match(/（(.)）/)
+        colWeekdays.push(m ? m[1] : null)
+      }
+  
+      // 遍历格子
+      for (let i = 1; i < rows.length; i++) {
+        const tds = rows[i].querySelectorAll('td')
+        const firstText = tds[0].innerText.replace(/\s/g, '')
+        // 跳过塩焼中央球场
+        if (firstText.includes('塩焼中央')) continue
+        for (let j = 2; j < tds.length; j++) {
+          const link = tds[j].querySelector('a')
+          if (!link) continue
+  
+          const val = link.innerText.replace(/\s/g, '')
+          if (val !== '○' && val !== '△') continue
+  
+          const weekday = colWeekdays[j - 2]
+  
+          candidates.push({
+            el: link,
+            weekday,
+          })
+        }
       }
     })
-  })
+  
+    // ========================
+    // ⭐ 1️⃣ 先选 AUTO_WEEKDAY
+    // ========================
+    for (const c of candidates) {
+      if (count >= MAX) break
+  
+      const wd = weekdayMap[c.weekday]
+      if (preferred.includes(wd)) {
+        c.el.click()
+        c.el.dataset.selected = '1'
+        count++
+      }
+    }
+  
+    // ========================
+    // ⭐ 2️⃣ 再补剩余
+    // ========================
+    for (const c of candidates) {
+      if (count >= MAX) break
+      if (c.el.dataset.selected) continue
+  
+      c.el.click()
+      count++
+    }
+  
+  }, config.AUTO_WEEKDAY_FILTER || [])
 
   await Promise.all([
     page.waitForNavigation({ waitUntil: 'networkidle' }),
@@ -515,7 +1119,7 @@ async function bookOne(d, trace = createTrace()) {
   ])
 
   logStep(trace, 'BOOK', '点击目标slot')
-  await page.click(`#${d.domId}`).catch(() => {})
+  await page.click(`#${d.domId}`)
 
   await Promise.all([
     page.waitForNavigation({ waitUntil: 'networkidle' }),
@@ -523,9 +1127,16 @@ async function bookOne(d, trace = createTrace()) {
   ])
 
   logStep(trace, 'BOOK', '提交预约')
-  await handleLoginIfNeeded(page)
-  await clickApply(page)
+  // await handleLoginIfNeeded(page)
+  // await clickApply(page)
 
+  await bot.sendMessage(
+    process.env.CHAT_ID,
+    `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n` +
+    formatText(d, { showBike: true, style: 'detail' }),
+    { parse_mode: 'Markdown' }
+  )
+  addBookedSlot(d)
   logStep(trace, 'BOOK_SUCCESS', `${d.court} ${d.time}`)
 
   await browser.close()
@@ -546,12 +1157,25 @@ registerTelegramHandlers({
   formatText,
   saveConfig,
   getLogFile,
-  getLogBuffer: () => logBuffer
+  getLogBuffer: () => logBuffer,
+  removeBookedSlot,
+  disableBookedReminder,
+  deleteReminderMessagesByUcode,
+  getBookedSlots
 })
 
 // ========================
 loadLastSet()
+loadAutoBooked()
+loadBookedSlots()
+loadReminderIndex()
+
 cleanOldLogs(30)
+
 monitor()
 timer = setInterval(monitor, Math.floor(Math.random() * (60) + config.INTERVAL) * 1000)
 setInterval(() => cleanOldLogs(30), 24 * 60 * 60 * 1000)
+// 预约提醒间隔
+setInterval(pushBookedReminderBySchedule, 60 * 1000)
+setInterval(pushUpcomingReminder, 60 * 1000)
+setInterval(cleanExpiredBooked, 24 * 60 * 60 * 1000)

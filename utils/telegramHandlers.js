@@ -1,4 +1,37 @@
 const stats = require('./stats')
+
+function buildPanelKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '🚀 立即扫描', callback_data: 'quick_run' },
+        { text: '📊 系统状态', callback_data: 'quick_status' }
+      ],
+      [
+        { text: '📍 场地开关', callback_data: 'quick_place' },
+        { text: '📚 预约记录', callback_data: 'quick_booked' }
+      ]
+    ]
+  }
+}
+
+function formatBookedLines(all, limit, formatText) {
+  const list = all
+    .slice()
+    .sort((a, b) => {
+      const ta = new Date(a.create || 0).getTime() || 0
+      const tb = new Date(b.create || 0).getTime() || 0
+      return tb - ta
+    })
+    .slice(0, limit)
+
+  const lines = list.map((d, i) => {
+    const status = d.reminderEnabled === false ? '🔕 已关提醒' : '🔔 提醒开'
+    return `${i + 1}. ${formatText(d, { style: 'detail' })}\n   ${status}\n   ucode: ${d.ucode}`
+  })
+  return { lines, list, total: all.length }
+}
+
 module.exports = function registerTelegramHandlers({
   bot,
   config,
@@ -14,28 +47,22 @@ module.exports = function registerTelegramHandlers({
   formatText,
   saveConfig,
   getLogFile,
-  getLogBuffer
+  getLogBuffer,
+  removeBookedSlot,
+  disableBookedReminder,
+  deleteReminderMessagesByUcode,
+  getBookedSlots
 }) {
   bot.setMyCommands([
-    { command: 'run', description: '🚀 执行监控（强制推送）' },
-    { command: 'status', description: '📊 查看系统状态' },
-    { command: 'listplace', description: '📋 场地面板（开关控制）' },
-    { command: 'stats', description: '👉 查看抢场统计' },
-
-    { command: 'config', description: '⚙️ 查看配置' },
-    { command: 'set', description: '✏️ 修改配置' },
-    { command: 'log', description: '📜 查看日志（/log 50）' },
-
+    { command: 'panel', description: '🎛️ 控制面板（常用）' },
+    { command: 'run', description: '🚀 立即扫描并推送' },
+    { command: 'status', description: '📊 系统状态' },
+    { command: 'listplace', description: '📍 场地开关' },
+    { command: 'booked', description: '📚 预约记录' },
+    { command: 'stats', description: '📈 抢场统计' },
     { command: 'pause', description: '⏸️ 暂停监控' },
     { command: 'resume', description: '▶️ 恢复监控' },
-
-    // ❗ 全部改小写
-    { command: 'enableplace', description: '🟢 开启场地监控' },
-    { command: 'disableplace', description: '⚪ 关闭场地监控' },
-    { command: 'addplace', description: '➕ 添加新场地' },
-    { command: 'removeplace', description: '❌ 删除场地' },
-
-    { command: 'help', description: '❓ 使用说明' }
+    { command: 'help', description: '❓ 帮助' }
   ])
 
   bot.on('callback_query', async (query) => {
@@ -50,14 +77,68 @@ module.exports = function registerTelegramHandlers({
       return
     }
 
-    if (data === 'quick_stats') {
-      await bot.answerCallbackQuery(query.id, { text: '📊 统计中...' })
+    if (data === 'quick_status') {
+      await bot.answerCallbackQuery(query.id, { text: '已生成' })
+      const placeStatus = Object.entries(config.PLACE_MAP)
+        .map(([name, v]) => {
+          const enabled = config.TARGET_PLACE.includes(name)
+          return `${enabled ? '🟢' : '⚪'} ${v.emoji} ${v.short}`
+        })
+        .join('\n')
 
-      const text = stats.buildReport()
+      const statusText =
+        `📊 *系统状态*\n━━━━━━━━━━━━━━\n` +
+        `📡 监控：${!!getTimer() ? '运行中' : '已暂停'}\n` +
+        `🤖 预约：${getBooking() ? '进行中' : '空闲'}\n` +
+        `📋 当前列表：${getCurrentData().length} 条\n\n` +
+        `🏟️ *场地*\n━━━━━━━━━━━━━━\n${placeStatus || '（无）'}\n\n` +
+        `⏱️ 间隔 ${config.INTERVAL}s · 提醒间隔 ${config.BOOKED_REMINDER_INTERVAL_HOURS ?? '?'}h`
 
-      await bot.sendMessage(query.message.chat.id, text, {
-        parse_mode: 'Markdown'
+      await bot.sendMessage(query.message.chat.id, statusText, { parse_mode: 'Markdown' })
+      return
+    }
+
+    if (data === 'quick_booked') {
+      await bot.answerCallbackQuery(query.id, { text: '📚 …' })
+      const all = getBookedSlots()
+      if (all.length === 0) {
+        await bot.sendMessage(query.message.chat.id, '📚 暂无预约记录')
+        return
+      }
+      const { lines, list, total } = formatBookedLines(all, 12, formatText)
+      await bot.sendMessage(
+        query.message.chat.id,
+        `📚 预约记录（最近 ${list.length}/${total} 条）\n━━━━━━━━━━━━━━\n${lines.join('\n\n')}`
+      )
+      return
+    }
+    if (data.startsWith('del_booked_')) {
+      const key = data.replace('del_booked_', '')
+      const updated = disableBookedReminder(key)
+      const n = await deleteReminderMessagesByUcode(key)
+  
+      await bot.answerCallbackQuery(query.id, {
+        text: updated
+          ? (n > 0 ? `✅ 已取消提醒，并清理 ${n} 条历史消息` : '✅ 已取消该预约提醒')
+          : '⚠️ 未找到对应预约记录'
       })
+  
+      try {
+        await bot.editMessageText(
+          `❌ 已删除提醒`,
+          {
+            chat_id: query.message.chat.id,
+            message_id: query.message.message_id
+          }
+        )
+      } catch (e) {
+        // 该消息可能已被 deleteReminderMessagesByUcode 删除，忽略
+      }
+      return
+    }
+
+    if (data === 'noop') {
+      await bot.answerCallbackQuery(query.id, { text: 'ℹ️ 仅展示信息' })
       return
     }
 
@@ -79,7 +160,7 @@ module.exports = function registerTelegramHandlers({
         ]
       })
 
-      await bot.sendMessage(query.message.chat.id, '📍 场地管理', {
+      await bot.sendMessage(query.message.chat.id, '📍 场地开关\n点右侧开启/关闭监控（立即生效）', {
         reply_markup: {
           inline_keyboard: rows
         }
@@ -145,27 +226,37 @@ module.exports = function registerTelegramHandlers({
       return
     }
 
-    const [version, indexStr] = query.data.split('_')
-    if (Number(version) !== getCurrentVersion()) return
+    if (/^\d+_\d+$/.test(data)) {
+      await bot.answerCallbackQuery(query.id, {
+        text: '⚠️ 旧按钮已过期，请使用最新推送'
+      })
+      return
+    }
 
-    const d = getCurrentData()[Number(indexStr)]
+    if (!data.startsWith('book_')) {
+      await bot.answerCallbackQuery(query.id, { text: '⚠️ 无效操作' })
+      return
+    }
+
+    const ucode = data.replace('book_', '')
+    const d = getCurrentData().find(item => item.ucode === ucode)
+    if (!d) {
+      await bot.answerCallbackQuery(query.id, {
+        text: '⚠️ 该场地已过期或不在最新列表'
+      })
+      return
+    }
 
     setBooking(true)
     await bot.answerCallbackQuery(query.id, { text: '🚀 开始预约...' })
 
     try {
       await bookOne(d)
-
-      await bot.sendMessage(
-        process.env.CHAT_ID,
-        `🎉 *预约成功！*\n━━━━━━━━━━━━━━\n${formatText(d, { showBike: true })}`,
-        { parse_mode: 'Markdown' }
-      )
       await monitor({ forcePush: true })
     } catch (e) {
       await bot.sendMessage(
         process.env.CHAT_ID,
-        `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatText(d)}\n\n🧨 ${e.message}`,
+        `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatText(d, { style: 'detail' })}\n\n🧨 ${e.message}`,
         { parse_mode: 'Markdown' }
       )
     } finally {
@@ -218,14 +309,22 @@ module.exports = function registerTelegramHandlers({
 
       await bot.sendMessage(
         msg.chat.id,
-        `✅ *配置已更新*
-      ━━━━━━━━━━━━━━
-      🔧 ${key} = \`${JSON.stringify(value)}\``,
-        { parse_mode: 'Markdown' }
+        `✅ 配置已更新\n━━━━━━━━━━━━━━\n${key} = ${JSON.stringify(value)}`
       )
     } catch (e) {
-      await bot.sendMessage(msg.chat.id, `❌ 修改失败`)
+      await bot.sendMessage(
+        msg.chat.id,
+        `❌ 修改失败：${e.message || e}`
+      )
     }
+  })
+
+  bot.onText(/\/panel/, async (msg) => {
+    if (!isAdmin(msg)) return
+    await bot.sendMessage(msg.chat.id, '🎛️ *控制面板*\n━━━━━━━━━━━━━━\n点下方按钮操作', {
+      parse_mode: 'Markdown',
+      reply_markup: buildPanelKeyboard()
+    })
   })
 
   // run
@@ -253,7 +352,11 @@ module.exports = function registerTelegramHandlers({
     if (!getTimer()) {
       setTimer(setInterval(monitor, config.INTERVAL * 1000))
     }
-    await bot.sendMessage(msg.chat.id, '监控已恢复*\n━━━━━━━━━━━━━━\n每 ${config.INTERVAL}s 执行一次')
+    await bot.sendMessage(
+      msg.chat.id,
+      `▶️ *监控已恢复*\n━━━━━━━━━━━━━━\n每 ${config.INTERVAL}s 执行一次`,
+      { parse_mode: 'Markdown' }
+    )
   })
 
   // status
@@ -289,17 +392,37 @@ ${placeStatus || '暂无场地'}
 🕒 时间过滤：${config.TIME_FILTER.join(', ') || '不限'}
 📅 星期过滤：${config.WEEKDAY_FILTER.join(', ') || '不限'}
 
-🚀 *快捷操作*
+🚀 *快捷入口*
 ━━━━━━━━━━━━━━
-/run ｜ /pause ｜ /resume
+/panel · /run · /pause · /resume
 `
 
     await bot.sendMessage(msg.chat.id, statusText, {
-      parse_mode: 'Markdown'
+      parse_mode: 'Markdown',
+      reply_markup: buildPanelKeyboard()
     })
   })
 
-  bot.onText(/\/addPlace (.+?) (.+?) (.+?) (.+)/, async (msg, match) => {
+  // booked history
+  bot.onText(/\/booked(?: (\d+))?/, async (msg, match) => {
+    if (!isAdmin(msg)) return
+
+    const limit = Math.max(1, Math.min(100, Number(match?.[1] || 15)))
+    const all = getBookedSlots()
+    if (all.length === 0) {
+      await bot.sendMessage(msg.chat.id, '📚 暂无历史预约记录')
+      return
+    }
+
+    const { lines, list, total } = formatBookedLines(all, limit, formatText)
+
+    await bot.sendMessage(
+      msg.chat.id,
+      `📚 历史预约（最近 ${list.length}/${total} 条）\n━━━━━━━━━━━━━━\n${lines.join('\n\n')}`
+    )
+  })
+
+  bot.onText(/\/addplace (.+?) (.+?) (.+?) (.+)/, async (msg, match) => {
     if (!isAdmin(msg)) return
 
     const [, name, short, emoji, bike] = match
@@ -345,16 +468,9 @@ ${placeStatus || '暂无场地'}
 
     await bot.sendMessage(
       msg.chat.id,
-      `📍 *场地管理面板*
+      `📍 *场地开关*
 ━━━━━━━━━━━━━━
-点击右侧按钮即可开关监控
-
-🟢 = 监控中
-⚪ = 已关闭
-
-💡 提示：
-- 只影响监控，不会删除场地
-- 修改立即生效`,
+右侧按钮开关监控（不删场地，立即生效）`,
       {
         parse_mode: 'Markdown',
         reply_markup: {
@@ -364,7 +480,7 @@ ${placeStatus || '暂无场地'}
     )
   })
 
-  bot.onText(/\/removePlace (.+)/, async (msg, match) => {
+  bot.onText(/\/removeplace (.+)/, async (msg, match) => {
     if (!isAdmin(msg)) return
 
     const name = match[1].trim()
@@ -393,74 +509,31 @@ ${placeStatus || '暂无场地'}
   bot.onText(/\/help/, async (msg) => {
     if (!isAdmin(msg)) return
   
-    const helpText = `
-  🧠 *网球场监控系统 v2*
-  ━━━━━━━━━━━━━━
-  
-  📊 *当前状态*
-  ━━━━━━━━━━━━━━
-  📡 监控：${!!getTimer() ? '✅ 运行中' : '⏸️ 已暂停'}
-  🤖 预约：${getBooking() ? '⏳ 执行中' : '🟢 空闲'}
-  
-  🚀 *核心操作*
-  ━━━━━━━━━━━━━━
-  /run        👉 立即扫描（强制推送）
-  /status     👉 查看系统状态
-  /stats      👉 查看抢场统计（🔥推荐）
-  
-  ⏯️ *运行控制*
-  ━━━━━━━━━━━━━━
-  /pause      👉 停止监控
-  /resume     👉 恢复监控
-  
-  🏟️ *场地管理*
-  ━━━━━━━━━━━━━━
-  /listplace  👉 可视化管理（推荐⭐）
-  /addplace 名称 简称 emoji 距离
-  /removeplace 名称
-  /enableplace 名称
-  /disableplace 名称
-  
-  ⚙️ *配置调整*
-  ━━━━━━━━━━━━━━
-  /config     👉 查看配置
-  /set KEY VAL 👉 修改配置
-  
-  示例：
-  /set INTERVAL 30
-  /set AUTO_BOOK true
-  /set TIME_FILTER ["18:00","21:00"]
-  
-  📜 *日志系统*
-  ━━━━━━━━━━━━━━
-  /log        👉 最近日志
-  /log 100    👉 最近100条
-  
-  📈 *统计系统（重点）*
-  ━━━━━━━━━━━━━━
-  /stats      👉 抢场速度分析
-  👉 自动统计：
-     • 不同场地
-     • 不同时段
-     • 被抢时间分布（1m/3m/5m/10m/1h/3h）
-  
-  💡 *使用建议*
-  ━━━━━━━━━━━━━━
-  • ⭐ 用 /listplace 管理场地
-  • 🔥 开启 AUTO_BOOK 自动抢
-  • 📊 定期看 /stats 优化策略
-  • ⏱️ 晚上时段竞争最激烈（重点关注）
-  
-  `
+    const helpText =
+      `🎾 网球场监控 · 帮助\n\n` +
+      `【常用】\n` +
+      `/panel  控制面板（下方按钮）\n` +
+      `/run  立即扫描并推送\n` +
+      `/status  状态（含面板）\n` +
+      `/listplace  场地开关\n` +
+      `/booked  预约记录（可加条数，如 /booked 20）\n` +
+      `/stats  抢场统计\n` +
+      `/pause · /resume  暂停/恢复定时扫描\n\n` +
+      `【说明】\n` +
+      `推送里点按钮预约；过期消息会提示刷新。\n` +
+      `取消提醒只关提醒，不删预约记录。\n\n` +
+      `【高级】\n` +
+      `/config  查看配置\n` +
+      `/set KEY 值  修改（例：/set INTERVAL 45）\n` +
+      `/log  日志（/log 100）\n` +
+      `/addplace … /removeplace …  增删场地`
+
     await bot.sendMessage(msg.chat.id, helpText, {
-      parse_mode: 'Markdown',
-      reply_markup: {
-        remove_keyboard: true
-      }
+      reply_markup: buildPanelKeyboard()
     })
   })
 
-  bot.onText(/\/enablePlace (.+)/, async (msg, match) => {
+  bot.onText(/\/enableplace (.+)/, async (msg, match) => {
     if (!isAdmin(msg)) return
 
     const name = match[1].trim()
@@ -490,7 +563,7 @@ ${meta.emoji} ${meta.short}
     )
   })
 
-  bot.onText(/\/disablePlace (.+)/, async (msg, match) => {
+  bot.onText(/\/disableplace (.+)/, async (msg, match) => {
     if (!isAdmin(msg)) return
 
     const name = match[1].trim()
@@ -523,19 +596,16 @@ ${meta.emoji} ${meta.short}
     if (!isAdmin(msg)) return
   
     const text = stats.buildReport()
-  
-    await bot.sendMessage(msg.chat.id, text, {
-      parse_mode: 'Markdown'
-    })
 
-    bot.sendMessage(msg.chat.id, '👇 常用操作', {
-      reply_markup: {
-        inline_keyboard: [
-          [{ text: '🚀 立即扫描', callback_data: 'quick_run' }],
-          [{ text: '📊 查看统计', callback_data: 'quick_stats' }],
-          [{ text: '📍 场地管理', callback_data: 'quick_place' }]
-        ]
-      }
+    if (text.length > 4000) {
+      await bot.sendMessage(msg.chat.id, '📈 统计过长，仅显示前 3800 字…')
+      await bot.sendMessage(msg.chat.id, text.slice(0, 3800))
+    } else {
+      await bot.sendMessage(msg.chat.id, text)
+    }
+
+    await bot.sendMessage(msg.chat.id, '👇 快捷操作', {
+      reply_markup: buildPanelKeyboard()
     })
   })
 }

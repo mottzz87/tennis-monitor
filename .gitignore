@@ -4,3 +4,6 @@ cache.json
 logs/
 stats/
 lastSet.json
+bookedSlots.json
+autoBooked.json
+reminderIndex.json
