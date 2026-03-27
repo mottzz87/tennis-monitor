@@ -294,7 +294,7 @@ async function monitor(options = {}) {
 
     logStep(trace, 'PARSE', `抓取数据: ${rawData.length}条`)
 
-    // await browser.close()
+    await browser.close()
 
     const data = filterSlotsByConfig(rawData, config)
     currentData = data
