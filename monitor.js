@@ -39,6 +39,20 @@ setupConsoleLogging(logBuffer)
 
 let config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'))
 
+
+let globalBrowser = null
+
+async function getBrowser() {
+  if (globalBrowser) return globalBrowser
+
+  globalBrowser = await chromium.launch({
+    headless: true,
+    args: ['--no-sandbox']
+  })
+
+  return globalBrowser
+}
+
 function getSkipCourtContains(cfg) {
   const raw = cfg?.SKIP_COURT_CONTAINS
   if (!Array.isArray(raw)) return []
@@ -690,13 +704,8 @@ async function monitor(options = {}) {
     logStep(trace, 'SKIP', '正在预约，跳过')
     return
   }
-  let browser
+  let browser = await getBrowser()
   try {
-    browser = await chromium.launch({
-      headless: true,
-      args: ['--no-sandbox']
-    })
-
     const page = await browser.newPage()
 
     await page.goto('https://reserve.city.ichikawa.lg.jp/')
@@ -1296,10 +1305,7 @@ async function monitor(options = {}) {
 async function bookOne(d, trace = createTrace()) {
   logStep(trace, 'BOOK', `开始预约 ${d.place} ${d.court} ${d.time}`)
 
-  const browser = await chromium.launch({
-    headless: true,
-    args: ['--no-sandbox']
-  })
+  let browser = await getBrowser()
 
   const page = await browser.newPage()
 
