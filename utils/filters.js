@@ -80,6 +80,7 @@ function filterSlotsByRules(data, rules) {
   const TIME_FILTER = rules.TIME_FILTER || []
   const WEEKDAY_FILTER = rules.WEEKDAY_FILTER || []
   const COURT_NUM_FILTER = rules.COURT_NUM_FILTER || []
+  const PLACE_FILTER = rules.PLACE_FILTER || []
   const WEEKDAY_JP = ['日', '月', '火', '水', '木', '金', '土']
 
   return data.filter(d => {
@@ -111,6 +112,17 @@ function filterSlotsByRules(data, rules) {
       })) return false
     }
 
+    if (PLACE_FILTER.length > 0) {
+      const placeStr = String(d.place || '')
+      const placeN = normalizeText(placeStr)
+      const hit = PLACE_FILTER.some(kw => {
+        const k = String(kw || '').trim()
+        if (!k) return false
+        return placeStr.includes(k) || placeN.includes(normalizeText(k))
+      })
+      if (!hit) return false
+    }
+
     return true
   })
 }
@@ -123,11 +135,20 @@ function filterSlotsByConfig(data, config) {
   })
 }
 
+function mergeAutoCourtKeywords(config) {
+  const k = Array.isArray(config.AUTO_COURT_KEYWORDS) ? config.AUTO_COURT_KEYWORDS : []
+  const n = Array.isArray(config.AUTO_COURT_NUM_FILTER) ? config.AUTO_COURT_NUM_FILTER : []
+  const merged = [...new Set([...k, ...n].map(String).map(s => s.trim()).filter(Boolean))]
+  if (merged.length > 0) return merged
+  return Array.isArray(config.COURT_NUM_FILTER) ? config.COURT_NUM_FILTER : []
+}
+
 function getAutoRules(config) {
   return {
     TIME_FILTER: Array.isArray(config.AUTO_TIME_FILTER) ? config.AUTO_TIME_FILTER : config.TIME_FILTER,
     WEEKDAY_FILTER: Array.isArray(config.AUTO_WEEKDAY_FILTER) ? config.AUTO_WEEKDAY_FILTER : config.WEEKDAY_FILTER,
-    COURT_NUM_FILTER: Array.isArray(config.AUTO_COURT_NUM_FILTER) ? config.AUTO_COURT_NUM_FILTER : config.COURT_NUM_FILTER
+    COURT_NUM_FILTER: Array.isArray(config.AUTO_COURT_NUM_FILTER) ? config.AUTO_COURT_NUM_FILTER : [],
+    PLACE_FILTER: Array.isArray(config.AUTO_PLACE_FILTER) ? config.AUTO_PLACE_FILTER : []
   }
 }
 

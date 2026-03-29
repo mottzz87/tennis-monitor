@@ -34,9 +34,16 @@ let bookedSlots = []
 let remindedSet = new Set() // 防止重复提醒
 let reminderIndex = {} // { [ucode]: [{ chatId, messageId }] }
 let logBuffer = []
+let currentSlotMap = new Map()
 setupConsoleLogging(logBuffer)
 
 let config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'))
+
+function getSkipCourtContains(cfg) {
+  const raw = cfg?.SKIP_COURT_CONTAINS
+  if (!Array.isArray(raw)) return []
+  return raw.map(s => String(s || '').trim()).filter(Boolean)
+}
 
 function saveConfig() {
   fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2))
@@ -153,6 +160,13 @@ function registerReminderMessage(ucode, chatId, messageId) {
   saveReminderIndex()
 }
 
+/** 仅从索引移除（不删 Telegram 消息），用于同条消息里关掉单条提醒 */
+function pruneReminderIndexForUcode(ucode) {
+  if (!ucode || !reminderIndex[ucode]) return
+  delete reminderIndex[ucode]
+  saveReminderIndex()
+}
+
 async function deleteReminderMessagesByUcode(ucode) {
   const list = reminderIndex[ucode] || []
   if (list.length === 0) return 0
@@ -173,6 +187,155 @@ async function deleteReminderMessagesByUcode(ucode) {
   return deleted
 }
 
+async function clickSlot(page, d) {
+
+  // ⭐ 若有 domId 且页面上仍存在该节点则直接点（结果页 id 常与监控页不一致，命中失败则走匹配）
+  if (d.domId) {
+    const el = await page.$(`#${d.domId}`)
+    if (el) {
+      await el.click()
+      return
+    }
+  }
+
+  // fallback：与 monitor 解析同一套表格结构 —— 日期在表头第 1 列，时间在各数据列顶格
+  const found = await page.evaluate((d) => {
+
+    const normalize = s =>
+      String(s)
+        .replace(/\s/g, '')
+        .replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+        .replace(/：/g, ':')
+        .replace(/～/g, '~')
+
+    const o = d.origin || d.oragin
+    const targetPlace = normalize(o?.placeText ?? o?.place ?? d.place)
+    const targetCourt = normalize(o?.courtText ?? o?.court ?? d.court)
+    const targetIso = String(d.date || '').trim()
+    const targetTimeRange = normalize(o?.timeText ?? o?.time ?? d.time)
+    const originDateRaw = o?.dateText ?? o?.date
+    const originTimeRaw = o?.timeText ?? o?.time
+
+    const dateTextMatchesTarget = (textNorm) => {
+      if (!textNorm) return false
+      if (originDateRaw) {
+        const on = normalize(originDateRaw)
+        if (on && (textNorm.includes(on) || on.includes(textNorm))) return true
+      }
+      if (/^\d{4}-\d{2}-\d{2}$/.test(targetIso)) {
+        const [y, mo, day] = targetIso.split('-').map(Number)
+        const patterns = [
+          normalize(`${y}年${mo}月${day}日`),
+          normalize(`${y}年${String(mo).padStart(2, '0')}月${String(day).padStart(2, '0')}日`),
+          normalize(`${mo}.${String(day).padStart(2, '0')}（`),
+          normalize(`${mo}.${day}（`),
+          normalize(`${String(mo).padStart(2, '0')}.${String(day).padStart(2, '0')}（`),
+          normalize(`${mo}/${day}（`),
+          normalize(`${mo}/${String(day).padStart(2, '0')}`),
+          normalize(`${String(mo).padStart(2, '0')}/${String(day).padStart(2, '0')}`)
+        ]
+        if (patterns.some(p => p && textNorm.includes(p))) return true
+      }
+      const fallback = normalize(targetIso)
+      return !!(fallback && textNorm.includes(fallback))
+    }
+
+    const columnHeaderHasOwnDate = (colNorm) =>
+      /\d{4}年\d{1,2}月\d{1,2}日/.test(colNorm) ||
+      /\d{1,2}月\d{1,2}日/.test(colNorm) ||
+      /\d{1,2}\.\d{1,2}（[月火水木金土日]）/.test(colNorm) ||
+      /\d{1,2}\/\d{1,2}（[月火水木金土日]）/.test(colNorm)
+
+    const timeHeaderMatches = (headerNorm) => {
+      if (!headerNorm) return false
+      const mRange = targetTimeRange.match(/^(\d{1,2})-(\d{1,2})$/)
+      if (mRange) {
+        const hs = Number(mRange[1])
+        const he = Number(mRange[2])
+        const m = headerNorm.match(/(\d{1,2}):\d{2}[~\-](\d{1,2}):\d{2}/)
+        if (m) return Number(m[1]) === hs && Number(m[2]) === he
+        if (headerNorm.includes(`${hs}:`) && headerNorm.includes(`${he}:`)) return true
+      }
+      if (originTimeRaw) {
+        const ot = normalize(originTimeRaw)
+        if (ot && (headerNorm.includes(ot) || ot.includes(headerNorm))) return true
+      }
+      return headerNorm.includes(targetTimeRange)
+    }
+
+    function placeNameForDgTable(dgTable) {
+      const tb = dgTable.closest('tbody')
+      if (tb) {
+        const a = tb.querySelector('a[id*="lnkShisetsu"]')
+        if (a) return String(a.innerText).replace(/\s+/g, ' ').trim()
+      }
+      let p = dgTable.parentElement
+      for (let n = 0; n < 28 && p; n++) {
+        if (p.tagName === 'TABLE' && p !== dgTable) {
+          const a = p.querySelector('a[id*="lnkShisetsu"]')
+          if (a && !dgTable.contains(a)) return String(a.innerText).replace(/\s+/g, ' ').trim()
+        }
+        p = p.parentElement
+      }
+      return ''
+    }
+
+    /** 市川：0=利用日 1=定員 2..=時間帯；無「定員」則 1 起為時間帯 */
+    function slotColumnStartIndex(headerTds) {
+      const h1 = String(headerTds[1]?.innerText || '').replace(/\s/g, '')
+      return h1.includes('定員') ? 2 : 1
+    }
+
+    const dgTables = document.querySelectorAll('table[id*="dgTable"]')
+
+    for (const table of dgTables) {
+      const placeRaw = placeNameForDgTable(table)
+      const currentPlace = normalize(placeRaw)
+
+      if (
+        !currentPlace ||
+        (!currentPlace.includes(targetPlace) && !targetPlace.includes(currentPlace))
+      ) continue
+
+      const rows = table.querySelectorAll('tr')
+      if (rows.length < 2) continue
+
+      const headerTds = rows[0].querySelectorAll('td')
+      const slot0 = slotColumnStartIndex(headerTds)
+      const rowDateNorm = normalize(headerTds[0]?.innerText || '')
+
+      for (let i = 1; i < rows.length; i++) {
+        const tds = rows[i].querySelectorAll('td')
+        const courtText = normalize(tds[0].innerText)
+
+        if (!courtText.includes(targetCourt)) continue
+
+        for (let j = slot0; j < tds.length; j++) {
+          const link = tds[j].querySelector('a')
+          if (!link) continue
+
+          const colHeaderNorm = normalize(headerTds[j]?.innerText || '')
+          const dateOk = columnHeaderHasOwnDate(colHeaderNorm)
+            ? dateTextMatchesTarget(colHeaderNorm)
+            : dateTextMatchesTarget(colHeaderNorm) || dateTextMatchesTarget(rowDateNorm)
+          if (!dateOk) continue
+          if (!timeHeaderMatches(colHeaderNorm)) continue
+
+          link.click()
+          return true
+        }
+      }
+    }
+
+    return false
+
+  }, d)
+
+  if (!found) {
+    throw new Error(`❌ 找不到 slot: ${d.place} ${d.court} ${d.date} ${d.time}`)
+  }
+}
+
 // ✅ 添加预约
 function addBookedSlot(d) {
   if (bookedSlots.some(s => s.uid === d.uid)) return
@@ -187,6 +350,7 @@ function addBookedSlot(d) {
     dateDisplay: d.dateDisplay || formatDateDisplayFromIso(date),
     ucode: buildUcode({ ...d, date, time }),
     reminderEnabled: true,
+    bookedAt: Date.now(),
     create: new Date().toLocaleString()
   })
 
@@ -271,6 +435,27 @@ function formatTimeDisplay(time) {
   return raw.replace('~', '–')
 }
 
+const TG_INLINE_BTN_TEXT_MAX = 64
+
+function truncateTelegramButtonText(s, max = TG_INLINE_BTN_TEXT_MAX) {
+  const str = String(s || '')
+  if (str.length <= max) return str
+  const chars = Array.from(str)
+  if (chars.length <= max) return str
+  return chars.slice(0, max - 1).join('') + '…'
+}
+
+/** 预约提醒：单行 🔕 按钮文案（关闭提醒，不删记录） */
+function formatReminderMuteButtonLabel(d) {
+  const meta = config.PLACE_MAP[d.place] || {}
+  const placeShort = (meta.short || d.place || '').trim()
+  const court = String(formatCourt(d.court) || '').toUpperCase()
+  const t = formatTimeDisplay(d.time)
+  const em = meta.emoji || '🎾'
+  const s = `🔕 ${em} ${placeShort} ${court} · ${t}`
+  return truncateTelegramButtonText(s)
+}
+
 function formatText(d, options = {}) {
   const { showBike = false, style = 'compact' } = options
 
@@ -302,8 +487,15 @@ function formatText(d, options = {}) {
   return `${emoji} ${placeShort} ${formatCourt(d.court)} ${shortDate} ${shortTime}${bike}`
 }
 
+function eligibleForBookedSummary(s) {
+  if (s.reminderEnabled === false) return false
+  const intervalMs = getBookedReminderIntervalMs()
+  if (s.bookedAt == null) return true
+  return Date.now() >= s.bookedAt + intervalMs
+}
+
 async function pushBookedReminder() {
-  const future = getFutureBookedSlots().filter(s => s.reminderEnabled !== false)
+  const future = getFutureBookedSlots().filter(eligibleForBookedSummary)
 
   if (future.length === 0) return
 
@@ -331,24 +523,20 @@ async function pushBookedReminder() {
       return ta - tb
     })
 
-    const text = list
-      .map(d => `• ${formatText(d)}`)
-      .join('\n')
-
-    // 👉 每条都带删除按钮
-    const buttons = list.map(d => ([
+    const dayTitle = list[0].dateDisplay || formatDateDisplayFromIso(dayKey) || dayKey
+    const buttons = list.map(d => [
       {
-        text: `❌ 取消 ${d.dateDisplay || formatDateDisplayFromIso(dayKey)} ${formatTimeDisplay(d.time)}`,
+        text: formatReminderMuteButtonLabel(d),
         callback_data: `del_booked_${d.ucode}`
       }
-    ]))
+    ])
 
-    const dayTitle = list[0].dateDisplay || formatDateDisplayFromIso(dayKey) || dayKey
     const sent = await bot.sendMessage(
       process.env.CHAT_ID,
-      `📅 *已预约提醒（${dayTitle}）*\n━━━━━━━━━━━━━━\n${text}`,
+      `📅 已预约提醒（${dayTitle}）\n` +
+        `━━━━━━━━━━━━━━\n` +
+        ``,
       {
-        parse_mode: 'Markdown',
         reply_markup: {
           inline_keyboard: buttons
         }
@@ -379,13 +567,13 @@ async function pushUpcomingReminder() {
 
       const sent = await bot.sendMessage(
         process.env.CHAT_ID,
-        `⏰ *即将开始（1小时内）*\n━━━━━━━━━━━━━━\n${formatText(d)}`,
+        `⏰ *即将开始（1小时内）*\n━━━━━━━━━━━━━━\n${formatText(d, { style: 'detail' })}`,
         {
           parse_mode: 'Markdown',
           reply_markup: {
             inline_keyboard: [[
               {
-                text: `❌ 取消 ${d.dateDisplay || formatDateDisplayFromIso(d.date)} ${formatTimeDisplay(d.time)}`,
+                text: formatReminderMuteButtonLabel(d),
                 callback_data: `del_booked_${d.ucode}`
               }
             ]]
@@ -496,7 +684,7 @@ async function pushBookedReminderBySchedule() {
 async function monitor(options = {}) {
   const { forcePush = false } = options
   const trace = createTrace()
-  logStep(trace, 'START', '开始监控')
+  logStep(trace, 'START')
 
   if (booking) {
     logStep(trace, 'SKIP', '正在预约，跳过')
@@ -504,7 +692,6 @@ async function monitor(options = {}) {
   }
   let browser
   try {
-    logStep(trace, 'BROWSER', '启动浏览器')
     browser = await chromium.launch({
       headless: true,
       args: ['--no-sandbox']
@@ -512,14 +699,11 @@ async function monitor(options = {}) {
 
     const page = await browser.newPage()
 
-    logStep(trace, 'NAV', '进入首页')
     await page.goto('https://reserve.city.ichikawa.lg.jp/')
 
-    logStep(trace, 'CLICK', '点击 スポーツ施設')
     await clickByText(page, 'スポーツ施設')
     await sleep(config.STEP_DELAY)
 
-    logStep(trace, 'FILTER', `选择场地: ${config.TARGET_PLACE.join(',')}`)
     for (const place of config.TARGET_PLACE) {
       await clickByText(page, place)
       await sleep(200)
@@ -530,7 +714,6 @@ async function monitor(options = {}) {
       page.click('#ucPCFooter_btnForward')
     ])
 
-    logStep(trace, 'STEP', '进入表示期间选择')
     await clickByText(page, getDurationText(config))
     await sleep(config.STEP_DELAY)
 
@@ -539,10 +722,13 @@ async function monitor(options = {}) {
       page.click('#ucPCFooter_btnForward')
     ])
 
-    logStep(trace, 'SCAN', '扫描空位按钮')
-    await page.evaluate((autoWeekdays) => {
+    await page.evaluate(({ autoWeekdays, skipCourtContains }) => {
       let count = 0
       const MAX = 10
+
+      const shouldSkipCourtRow = (rowCourtNorm) =>
+        Array.isArray(skipCourtContains) &&
+        skipCourtContains.some(sub => sub && rowCourtNorm.includes(sub))
     
       const weekdayMap = {
         '日': 0,
@@ -568,29 +754,34 @@ async function monitor(options = {}) {
         if (rows.length === 0) return
     
         const headers = rows[0].querySelectorAll('td')
+        const h1 = String(headers[1]?.innerText || '').replace(/\s/g, '')
+        const slot0 = h1.includes('定員') ? 2 : 1
     
-        // 每一列对应一个日期（含星期）
+        const row0Wd = String(headers[0]?.innerText || '')
+          .replace(/\s/g, '')
+          .match(/（([月火水木金土日])）/)
+        const rowWeekday = row0Wd ? row0Wd[1] : null
+    
         const colWeekdays = []
-    
-        for (let i = 2; i < headers.length; i++) {
+        for (let i = slot0; i < headers.length; i++) {
           const text = headers[i].innerText.replace(/\s/g, '')
-          const m = text.match(/（(.)）/)
-          colWeekdays.push(m ? m[1] : null)
+          const m = text.match(/（([月火水木金土日])）/)
+          colWeekdays.push(m ? m[1] : rowWeekday)
         }
     
-        // 遍历格子
         for (let i = 1; i < rows.length; i++) {
           const tds = rows[i].querySelectorAll('td')
+          const rowCourt = (tds[0]?.innerText || '').replace(/\s/g, '')
+          if (shouldSkipCourtRow(rowCourt)) continue
     
-          for (let j = 2; j < tds.length; j++) {
+          for (let j = slot0; j < tds.length; j++) {
             const link = tds[j].querySelector('a')
             if (!link) continue
     
             const val = link.innerText.replace(/\s/g, '')
             if (val !== '○' && val !== '△') continue
     
-            const weekday = colWeekdays[j - 2]
-    
+            const weekday = colWeekdays[j - slot0]
             candidates.push({
               el: link,
               weekday,
@@ -624,50 +815,146 @@ async function monitor(options = {}) {
         count++
       }
     
-    }, config.AUTO_WEEKDAY_FILTER || [])
+    }, {
+      autoWeekdays: config.AUTO_WEEKDAY_FILTER || [],
+      skipCourtContains: getSkipCourtContains(config)
+    })
 
     await Promise.all([
       page.waitForNavigation({ waitUntil: 'networkidle' }),
       page.click('#ucPCFooter_btnForward')
     ])
 
-    logStep(trace, 'NAV', '进入结果页')
 
-    const rawData = await page.evaluate(() => {
-      const result = []
-      let currentPlace = ''
-      const tables = document.querySelectorAll('table')
+    const rawData = await page.evaluate((skipCourtContains) => {
+      const shouldSkipCourtRow = (courtText) =>
+        Array.isArray(skipCourtContains) &&
+        skipCourtContains.some(sub => sub && String(courtText).includes(sub))
 
-      for (const table of tables) {
-        const placeEl = table.querySelector('a[id*="lnkShisetsu"]')
-        if (placeEl) {
-          currentPlace = placeEl.innerText.trim()
-          continue
+      const halfNum = (s) =>
+        String(s).replace(/[０-９]/g, ch =>
+          String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+
+      /** 每列表头常带独立「利用日」；不能用第 0 列日期代表整行 */
+      function resolveRawDateTimeForColumn(headers, j, timesArr, slotColStart) {
+        const row0 = halfNum(headers[0].innerText).replace(/\s/g, '')
+        const col = halfNum(headers[j].innerText).replace(/\s/g, '')
+        let rawDate = row0
+        let rawTime = timesArr[j - slotColStart]
+
+        const ymdCol = col.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/)
+        if (ymdCol) {
+          rawDate = ymdCol[0]
+          let rest = col.slice(ymdCol.index + ymdCol[0].length)
+          const wd = rest.match(/^（[月火水木金土日]）/)
+          if (wd) {
+            rawDate += wd[0]
+            rest = rest.slice(wd[0].length)
+          }
+          const tm = rest.match(/(\d{1,2}:\d{2})[～~\-](\d{1,2}:\d{2})/)
+          if (tm) rawTime = `${tm[1]}～${tm[2]}`
+          return { rawDate, rawTime }
         }
 
-        if (!table.id || !table.id.includes('dgTable')) continue
+        const mdCol = col.match(/(\d{1,2})月(\d{1,2})日/)
+        if (mdCol) {
+          const yFromRow = row0.match(/(\d{4})年/)
+          if (yFromRow) {
+            rawDate = `${yFromRow[1]}年${mdCol[1]}月${mdCol[2]}日`
+            let rest = col.slice(mdCol.index + mdCol[0].length)
+            const wd = rest.match(/^（[月火水木金土日]）/)
+            if (wd) {
+              rawDate += wd[0]
+              rest = rest.slice(wd[0].length)
+            }
+            const tm = rest.match(/(\d{1,2}:\d{2})[～~\-](\d{1,2}:\d{2})/)
+            if (tm) rawTime = `${tm[1]}～${tm[2]}`
+            return { rawDate, rawTime }
+          }
+        }
+
+        const dotMd = col.match(/(\d{1,2})\.(\d{1,2})（([月火水木金土日])）/)
+        if (dotMd) {
+          const ymdRow = row0.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/)
+          if (ymdRow) {
+            rawDate =
+              `${ymdRow[1]}年${Number(dotMd[1])}月${Number(dotMd[2])}日（${dotMd[3]}）`
+            const after = col.slice(dotMd.index + dotMd[0].length)
+            const tm = after.match(/(\d{1,2}:\d{2})[～~\-](\d{1,2}:\d{2})/)
+            if (tm) rawTime = `${tm[1]}～${tm[2]}`
+            return { rawDate, rawTime }
+          }
+        }
+
+        const slashMd = col.match(/(\d{1,2})\/(\d{1,2})（([月火水木金土日])）/)
+        if (slashMd) {
+          const ymdRow = row0.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/)
+          if (ymdRow) {
+            rawDate =
+              `${ymdRow[1]}年${Number(slashMd[1])}月${Number(slashMd[2])}日（${slashMd[3]}）`
+            const after = col.slice(slashMd.index + slashMd[0].length)
+            const tm = after.match(/(\d{1,2}:\d{2})[～~\-](\d{1,2}:\d{2})/)
+            if (tm) rawTime = `${tm[1]}～${tm[2]}`
+            return { rawDate, rawTime }
+          }
+        }
+
+        return { rawDate, rawTime }
+      }
+
+      function placeNameForDgTable(dgTable) {
+        const tb = dgTable.closest('tbody')
+        if (tb) {
+          const a = tb.querySelector('a[id*="lnkShisetsu"]')
+          if (a) return String(a.innerText).replace(/\s+/g, ' ').trim()
+        }
+        let p = dgTable.parentElement
+        for (let n = 0; n < 28 && p; n++) {
+          if (p.tagName === 'TABLE' && p !== dgTable) {
+            const a = p.querySelector('a[id*="lnkShisetsu"]')
+            if (a && !dgTable.contains(a)) return String(a.innerText).replace(/\s+/g, ' ').trim()
+          }
+          p = p.parentElement
+        }
+        return ''
+      }
+
+      function slotColumnStartIndex(headerTds) {
+        const h1 = String(headerTds[1]?.innerText || '').replace(/\s/g, '')
+        return h1.includes('定員') ? 2 : 1
+      }
+
+      const result = []
+      const dgTables = document.querySelectorAll('table[id*="dgTable"]')
+
+      for (const table of dgTables) {
+        const currentPlace = placeNameForDgTable(table)
 
         const rows = table.querySelectorAll('tr')
         const headers = rows[0].querySelectorAll('td')
+        const slot0 = slotColumnStartIndex(headers)
 
         const times = []
-        for (let i = 2; i < headers.length; i++) {
+        for (let i = slot0; i < headers.length; i++) {
           times.push(headers[i].innerText.replace(/\s/g, ''))
         }
 
         for (let i = 1; i < rows.length; i++) {
           const tds = rows[i].querySelectorAll('td')
           const court = tds[0].innerText.trim()
+          if (shouldSkipCourtRow(court)) continue
 
-          for (let j = 2; j < tds.length; j++) {
+          for (let j = slot0; j < tds.length; j++) {
             const link = tds[j].querySelector('a')
             if (!link) continue
 
             const val = link.innerText.replace(/\s/g, '')
 
             if (val === '○' || val === '△') {
-              const rawDate = headers[0].innerText.replace(/\s/g, '');
-              const rawTime = times[j - 2];
+              const { rawDate: rawDateCompact, rawTime: rawTimeFromCol } =
+                resolveRawDateTimeForColumn(headers, j, times, slot0)
+              const rawDate = rawDateCompact
+              const rawTime = rawTimeFromCol
               const formatStr = str => String(str)
               .toLowerCase()
               .replace(/\u3000/g, ' ')
@@ -703,7 +990,15 @@ async function monitor(options = {}) {
                 return Number.isNaN(h) ? '0' : String(h);
               };
               const timeFormatted = `${toHour(startRaw)}-${toHour(endRaw)}`; // 13-15
+              
               result.push({
+                origin: {
+                  place: currentPlace,
+                  court,
+                  domId: link.id,
+                  time: rawTime,
+                  date: rawDate
+                },
                 place: currentPlace,
                 court: formatStr(court),
                 date: dateFormatted,
@@ -718,31 +1013,42 @@ async function monitor(options = {}) {
       }
 
       return result
-    })
+    }, getSkipCourtContains(config))
 
     logStep(trace, 'PARSE', `抓取数据: ${rawData.length}条`)
 
-    // await browser.close()
-
+    // ========================
+    // 处理数据
+    // ========================
     const sourceData = rawData.map(d => {
       const date = parseSlotDayKey(d) || d.date
       const time = normalizeTimeRange(d.time)
       const dateDisplay = d.dateDisplay || formatDateDisplayFromIso(date)
-      return { ...d, date, time, dateDisplay }
-    })
-    const data = filterSlotsByConfig(
-      sourceData.map(d => ({ ...d, ucode: buildUcode(d) })),
-      config
-    )
-    currentData = data
-    currentVersion = Date.now()
-    logStep(trace, 'FILTER', `过滤后: ${data.length}条`)
 
-    if (data[0]) {
-      logStep(trace, 'SAMPLE', JSON.stringify(data[0]))
+      const ucode = buildUcode({ ...d, date, time })
+
+      return {
+        ...d,
+        date,
+        time,
+        dateDisplay,
+        ucode
+      }
+    })
+
+    // ⭐ 建立映射（核心）
+    const slotMap = new Map()
+    for (const d of sourceData) {
+      slotMap.set(d.ucode, d)
     }
 
-    console.log('可预约:', data.length)
+
+    const data = filterSlotsByConfig(sourceData, config)
+    currentData = data
+    currentVersion = Date.now()
+    currentSlotMap = slotMap
+
+    logStep(trace, 'FILTER', `过滤后: ${data.length}条`)
 
     const newSet = new Set(data.map(d => d.uid))
 
@@ -905,7 +1211,7 @@ async function monitor(options = {}) {
                 targets.map(async d => {
                   logStep(trace, 'AUTO_BOOK', `选中 ${d.place} ${d.time}`)
                   try {
-                    await page.click(`#${d.domId}`)
+                    await clickSlot(page, d)
                   } catch (e) {
                     logStep(trace, 'AUTO_BOOK_CLICK_FAIL', `${d.domId}`)
                     throw e
@@ -921,8 +1227,8 @@ async function monitor(options = {}) {
                 page.click('#ucPCFooter_btnForward')
               ])
 
-              // await handleLoginIfNeeded(page)
-              // await clickApply(page)
+              await handleLoginIfNeeded(page)
+              await clickApply(page)
 
               // ========================
               // ⭐ 标记已预约的日期
@@ -1025,9 +1331,13 @@ async function bookOne(d, trace = createTrace()) {
   // ✅ 不够 10 个 → 再补其他
   // ✅ 不影响 monitor 全量扫描能力
   // ========================
-  await page.evaluate((autoWeekdays) => {
+  await page.evaluate(({ autoWeekdays, skipCourtContains }) => {
     let count = 0
     const MAX = 10
+
+    const shouldSkipCourtRow = (rowCourtNorm) =>
+      Array.isArray(skipCourtContains) &&
+      skipCourtContains.some(sub => sub && rowCourtNorm.includes(sub))
   
     const weekdayMap = {
       '日': 0,
@@ -1053,30 +1363,33 @@ async function bookOne(d, trace = createTrace()) {
       if (rows.length === 0) return
   
       const headers = rows[0].querySelectorAll('td')
+      const h1 = String(headers[1]?.innerText || '').replace(/\s/g, '')
+      const slot0 = h1.includes('定員') ? 2 : 1
   
-      // 每一列对应一个日期（含星期）
+      const row0Wd = String(headers[0]?.innerText || '')
+        .replace(/\s/g, '')
+        .match(/（([月火水木金土日])）/)
+      const rowWeekday = row0Wd ? row0Wd[1] : null
+  
       const colWeekdays = []
-  
-      for (let i = 2; i < headers.length; i++) {
+      for (let i = slot0; i < headers.length; i++) {
         const text = headers[i].innerText.replace(/\s/g, '')
-        const m = text.match(/（(.)）/)
-        colWeekdays.push(m ? m[1] : null)
+        const m = text.match(/（([月火水木金土日])）/)
+        colWeekdays.push(m ? m[1] : rowWeekday)
       }
   
-      // 遍历格子
       for (let i = 1; i < rows.length; i++) {
         const tds = rows[i].querySelectorAll('td')
-        const firstText = tds[0].innerText.replace(/\s/g, '')
-        // 跳过塩焼中央球场
-        if (firstText.includes('塩焼中央')) continue
-        for (let j = 2; j < tds.length; j++) {
+        const rowCourt = (tds[0]?.innerText || '').replace(/\s/g, '')
+        if (shouldSkipCourtRow(rowCourt)) continue
+        for (let j = slot0; j < tds.length; j++) {
           const link = tds[j].querySelector('a')
           if (!link) continue
   
           const val = link.innerText.replace(/\s/g, '')
           if (val !== '○' && val !== '△') continue
   
-          const weekday = colWeekdays[j - 2]
+          const weekday = colWeekdays[j - slot0]
   
           candidates.push({
             el: link,
@@ -1111,7 +1424,10 @@ async function bookOne(d, trace = createTrace()) {
       count++
     }
   
-  }, config.AUTO_WEEKDAY_FILTER || [])
+  }, {
+    autoWeekdays: config.AUTO_WEEKDAY_FILTER || [],
+    skipCourtContains: getSkipCourtContains(config)
+  })
 
   await Promise.all([
     page.waitForNavigation({ waitUntil: 'networkidle' }),
@@ -1119,7 +1435,7 @@ async function bookOne(d, trace = createTrace()) {
   ])
 
   logStep(trace, 'BOOK', '点击目标slot')
-  await page.click(`#${d.domId}`)
+  await clickSlot(page, d)
 
   await Promise.all([
     page.waitForNavigation({ waitUntil: 'networkidle' }),
@@ -1127,8 +1443,8 @@ async function bookOne(d, trace = createTrace()) {
   ])
 
   logStep(trace, 'BOOK', '提交预约')
-  // await handleLoginIfNeeded(page)
-  // await clickApply(page)
+  await handleLoginIfNeeded(page)
+  await clickApply(page)
 
   await bot.sendMessage(
     process.env.CHAT_ID,
@@ -1148,6 +1464,7 @@ registerTelegramHandlers({
   isAdmin,
   getCurrentData: () => currentData,
   getCurrentVersion: () => currentVersion,
+  getSlotMap: () => currentSlotMap,
   getBooking: () => booking,
   setBooking: (v) => { booking = v },
   getTimer: () => timer,
@@ -1161,6 +1478,7 @@ registerTelegramHandlers({
   removeBookedSlot,
   disableBookedReminder,
   deleteReminderMessagesByUcode,
+  pruneReminderIndexForUcode,
   getBookedSlots
 })
 

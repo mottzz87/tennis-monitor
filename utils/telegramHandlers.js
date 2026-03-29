@@ -26,8 +26,8 @@ function formatBookedLines(all, limit, formatText) {
     .slice(0, limit)
 
   const lines = list.map((d, i) => {
-    const status = d.reminderEnabled === false ? '🔕 已关提醒' : '🔔 提醒开'
-    return `${i + 1}. ${formatText(d, { style: 'detail' })}\n   ${status}\n   ucode: ${d.ucode}`
+    const status = d.reminderEnabled === false ? '🔕' : '🔔'
+    return `${i + 1}. ${formatText(d, { style: 'detail' })}   ${status}`
   })
   return { lines, list, total: all.length }
 }
@@ -38,6 +38,7 @@ module.exports = function registerTelegramHandlers({
   isAdmin,
   getCurrentData,
   getCurrentVersion,
+  getSlotMap,
   getBooking,
   setBooking,
   getTimer,
@@ -50,7 +51,7 @@ module.exports = function registerTelegramHandlers({
   getLogBuffer,
   removeBookedSlot,
   disableBookedReminder,
-  deleteReminderMessagesByUcode,
+  pruneReminderIndexForUcode,
   getBookedSlots
 }) {
   bot.setMyCommands([
@@ -115,25 +116,40 @@ module.exports = function registerTelegramHandlers({
     if (data.startsWith('del_booked_')) {
       const key = data.replace('del_booked_', '')
       const updated = disableBookedReminder(key)
-      const n = await deleteReminderMessagesByUcode(key)
-  
-      await bot.answerCallbackQuery(query.id, {
-        text: updated
-          ? (n > 0 ? `✅ 已取消提醒，并清理 ${n} 条历史消息` : '✅ 已取消该预约提醒')
-          : '⚠️ 未找到对应预约记录'
-      })
-  
+
+      if (!updated) {
+        await bot.answerCallbackQuery(query.id, { text: '⚠️ 未找到对应预约记录' })
+        return
+      }
+
+      const targetCb = `del_booked_${key}`
+      const rows = query.message.reply_markup?.inline_keyboard || []
+      const newRows = rows.filter((row) =>
+        !row.some((btn) => btn.callback_data === targetCb)
+      )
+
       try {
-        await bot.editMessageText(
-          `❌ 已删除提醒`,
-          {
+        if (newRows.length === 0) {
+          await bot.editMessageText('🔕 本组预约提醒已全部关闭', {
             chat_id: query.message.chat.id,
             message_id: query.message.message_id
-          }
-        )
+          })
+        } else {
+          await bot.editMessageReplyMarkup(
+            { inline_keyboard: newRows },
+            {
+              chat_id: query.message.chat.id,
+              message_id: query.message.message_id
+            }
+          )
+        }
       } catch (e) {
-        // 该消息可能已被 deleteReminderMessagesByUcode 删除，忽略
+        console.warn('[del_booked] 更新消息失败:', e.message)
       }
+
+      pruneReminderIndexForUcode(key)
+
+      await bot.answerCallbackQuery(query.id, { text: '🔕 已关闭该条提醒' })
       return
     }
 
@@ -239,10 +255,13 @@ module.exports = function registerTelegramHandlers({
     }
 
     const ucode = data.replace('book_', '')
-    const d = getCurrentData().find(item => item.ucode === ucode)
-    if (!d) {
+
+    // ⭐ 从原始映射取（核心！！！）
+    const raw = getSlotMap().get(ucode)
+
+    if (!raw) {
       await bot.answerCallbackQuery(query.id, {
-        text: '⚠️ 该场地已过期或不在最新列表'
+        text: '⚠️ 数据已过期，请重新获取'
       })
       return
     }
@@ -251,12 +270,12 @@ module.exports = function registerTelegramHandlers({
     await bot.answerCallbackQuery(query.id, { text: '🚀 开始预约...' })
 
     try {
-      await bookOne(d)
+      await bookOne(raw)
       await monitor({ forcePush: true })
     } catch (e) {
       await bot.sendMessage(
         process.env.CHAT_ID,
-        `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatText(d, { style: 'detail' })}\n\n🧨 ${e.message}`,
+        `❌ *预约失败*\n━━━━━━━━━━━━━━\n${formatText(raw, { style: 'detail' })}\n\n🧨 ${e.message}`,
         { parse_mode: 'Markdown' }
       )
     } finally {
@@ -594,14 +613,11 @@ ${meta.emoji} ${meta.short}
 
   bot.onText(/\/stats/, async (msg) => {
     if (!isAdmin(msg)) return
-  
-    const text = stats.buildReport()
 
-    if (text.length > 4000) {
-      await bot.sendMessage(msg.chat.id, '📈 统计过长，仅显示前 3800 字…')
-      await bot.sendMessage(msg.chat.id, text.slice(0, 3800))
-    } else {
-      await bot.sendMessage(msg.chat.id, text)
+    const parts = stats.splitForTelegram(stats.buildReport(), 3800)
+    for (let i = 0; i < parts.length; i++) {
+      const prefix = parts.length > 1 ? `(${i + 1}/${parts.length}) ` : ''
+      await bot.sendMessage(msg.chat.id, prefix + parts[i])
     }
 
     await bot.sendMessage(msg.chat.id, '👇 快捷操作', {
