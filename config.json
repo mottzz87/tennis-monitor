@@ -46,7 +46,7 @@
   "//12": "⭐ 是否首次执行就推送",
   "PUSH_ON_INIT": true,
   "//12.1": "🔔 已预约「汇总」提醒间隔（小时）；成功当下只发成功消息，满间隔后才发汇总；开场后不再提醒",
-  "BOOKED_REMINDER_INTERVAL_HOURS": 0.1,
+  "BOOKED_REMINDER_INTERVAL_HOURS": 3,
   "PLACE_MAP": {
     "国府台テニスコート": {
       "short": "国府台",

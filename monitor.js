@@ -684,7 +684,7 @@ async function pushBookedReminderBySchedule() {
 async function monitor(options = {}) {
   const { forcePush = false } = options
   const trace = createTrace()
-  logStep(trace, 'START')
+  logStep(trace, 'START', '')
 
   if (booking) {
     logStep(trace, 'SKIP', '正在预约，跳过')
