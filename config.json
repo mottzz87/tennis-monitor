@@ -25,17 +25,21 @@
   "//9": "🎯 场地关键字过滤（比如只要Aコート就是cA,其他也可以是c1）",
   "COURT_NUM_FILTER": [],
   "//9.0": "🚫 コート名に含む行を除外（監視解析・週一括選択・bookOne）；空配列=除外なし",
-  "SKIP_COURT_CONTAINS": ["塩焼中央"],
-  "AUTO_TIME_FILTER": [],
+  "SKIP_COURT_CONTAINS": [
+    "塩焼中央"
+  ],
+  "AUTO_BOOK_DELAY_MINUTES": 0.3,
+  "AUTO_BOOK_MAX_WAIT_MINUTES": 4,
+  "AUTO_TIME_FILTER": [
+    "15-17"
+  ],
   "//8.1": "🎯 自动抢的星期过滤（优先于 WEEKDAY_FILTER）为空=全部",
   "AUTO_WEEKDAY_FILTER": [
-    "土",
-    "日"
+    "火"
   ],
   "//9.1": "🎯 自动抢的place",
   "AUTO_PLACE_FILTER": [
-    "福栄",
-    "菅野"
+    "行徳"
   ],
   "//9.2": "🎯 自动抢场地（与 KEYWORDS 合并；都空则沿用全局 COURT_NUM_FILTER）",
   "AUTO_COURT_NUM_FILTER": [],

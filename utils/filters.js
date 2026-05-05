@@ -49,28 +49,36 @@ function normalizeDate(dateStr) {
   return `${y}-${mo}-${d}`
 }
 
-function toMinutes(timeStr) {
-  const t = String(timeStr).trim()
-  if (t.includes(':')) {
-    const [hour = 0, minute = 0] = t.split(':').map(Number)
-    return hour * 60 + minute
+function toMinutesSafe(timeStr) {
+  timeStr = String(timeStr)
+
+  // 支持 "15" / "15:00"
+  if (timeStr.includes(':')) {
+    const [h, m] = timeStr.split(':').map(Number)
+    return h * 60 + (m || 0)
   }
-  const hour = Number(t)
-  if (Number.isNaN(hour)) return 0
-  return hour * 60
+
+  return Number(timeStr) * 60
 }
 
 function matchTime(dTime, filter) {
-  const start = String(dTime).split(/[～~\-]/)[0]
-  const startMin = toMinutes(start)
+  const startRaw = String(dTime).split(/[～~\-]/)[0].trim()
+  const startMin = toMinutesSafe(startRaw)
 
   if (filter.length === 1) {
-    return startMin >= toMinutes(filter[0])
+    const f = String(filter[0])
+
+    if (f.includes('-')) {
+      const [min, max] = f.split('-').map(toMinutesSafe)
+      return startMin >= min && startMin < max
+    }
+
+    return startMin >= toMinutesSafe(f)
   }
 
   if (filter.length === 2) {
-    const [min, max] = filter.map(toMinutes)
-    return startMin >= min && startMin <= max
+    const [min, max] = filter.map(toMinutesSafe)
+    return startMin >= min && startMin < max
   }
 
   return true
@@ -145,7 +153,9 @@ function mergeAutoCourtKeywords(config) {
 
 function getAutoRules(config) {
   return {
-    TIME_FILTER: Array.isArray(config.AUTO_TIME_FILTER) ? config.AUTO_TIME_FILTER : config.TIME_FILTER,
+    TIME_FILTER: (config.AUTO_TIME_FILTER && config.AUTO_TIME_FILTER.length > 0)
+    ? config.AUTO_TIME_FILTER
+    : config.TIME_FILTER,
     WEEKDAY_FILTER: Array.isArray(config.AUTO_WEEKDAY_FILTER) ? config.AUTO_WEEKDAY_FILTER : config.WEEKDAY_FILTER,
     COURT_NUM_FILTER: Array.isArray(config.AUTO_COURT_NUM_FILTER) ? config.AUTO_COURT_NUM_FILTER : [],
     PLACE_FILTER: Array.isArray(config.AUTO_PLACE_FILTER) ? config.AUTO_PLACE_FILTER : []

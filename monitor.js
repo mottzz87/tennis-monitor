@@ -35,6 +35,7 @@ let remindedSet = new Set() // 防止重复提醒
 let reminderIndex = {} // { [ucode]: [{ chatId, messageId }] }
 let logBuffer = []
 let currentSlotMap = new Map()
+
 setupConsoleLogging(logBuffer)
 
 let config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'))
@@ -662,6 +663,13 @@ let isFirstRun = true
 let timer = null
 let lastBookedReminderAt = 0
 
+
+// ========================
+// ⭐ 自动抢候选池（带时间）
+// ========================
+let autoCandidateMap = new Map()
+// uid -> { firstSeenAt, data }
+
 function getBookedReminderIntervalMs() {
   const hours = Number(config.BOOKED_REMINDER_INTERVAL_HOURS)
   if (Number.isFinite(hours) && hours > 0) {
@@ -693,7 +701,7 @@ async function monitor(options = {}) {
   let browser
   try {
     browser = await chromium.launch({
-      headless: true,
+      headless: false,
       args: ['--no-sandbox']
     })
 
@@ -1055,7 +1063,8 @@ async function monitor(options = {}) {
     if (isFirstRun) {
       isFirstRun = false
       console.log('🚀 首次运行')
-
+      // ⭐ 防止历史 slot 被抢
+      autoCandidateMap.clear()  
       if (config.PUSH_ON_INIT) {
         currentData = data
         currentVersion = Date.now()
@@ -1077,6 +1086,32 @@ async function monitor(options = {}) {
     }
 
     const added = data.filter(d => !lastSet.has(d.uid))
+    const nowTs = Date.now()
+
+    // ========================
+    // ⭐ 记录新增 slot 的出现时间
+    // ========================
+    // ✅ 每次用当前数据驱动池子
+    for (const d of data) {
+      if (!autoCandidateMap.has(d.uid)) {
+        autoCandidateMap.set(d.uid, {
+          firstSeenAt: nowTs,
+          data: d
+        })
+      } else {
+        // ⭐ 更新 data（防止引用旧数据）
+        const item = autoCandidateMap.get(d.uid)
+        item.data = d
+      }
+    }
+    // ========================
+    // ⭐ 清理已经不存在的 slot
+    // ========================
+    for (const uid of autoCandidateMap.keys()) {
+      if (!newSet.has(uid)) {
+        autoCandidateMap.delete(uid)
+      }
+    }
     const removed = [...lastSet]
     .filter(k => !newSet.has(k))
     .map(k => {
@@ -1089,13 +1124,16 @@ async function monitor(options = {}) {
     stats.record('removed', removed)
     logStep(trace, 'DIFF', `新增:${added.length} 减少:${removed.length}`)
 
+    // ========================
+    // ⭐ 不再因为“无变化”直接 return
+    // ========================
     if (added.length === 0 && removed.length === 0) {
       if (forcePush) {
         logStep(trace, 'FORCE_PUSH', `强制推送当前数据 ${data.length}`)
-    
+
         currentData = data
         currentVersion = Date.now()
-    
+
         if (data.length > 0) {
           await sendTelegram(data, currentVersion)
         } else {
@@ -1106,176 +1144,175 @@ async function monitor(options = {}) {
           )
         }
       } else {
-        console.log('⏸️ 无变化')
+        console.log('⏸️ 无变化（但继续 AUTO_BOOK）')
       }
-      return
     }
 
+    // ========================
+    // ⭐ 更新 lastSet（每轮都更新）
+    // ========================
     lastSet = new Set(data.map(d => d.uid))
     saveLastSet()
 
-    if (added.length > 0) {
-      // 先按“通知规则”处理 Telegram（如果你开了通知）
-      if (config.NOTIFY_ADDED) {
-        logStep(trace, 'PUSH', `发送新增通知 ${added.length}`)
+    // ========================
+    // ⭐ 新增通知（保持原逻辑）
+    // ========================
+    if (added.length > 0 && config.NOTIFY_ADDED) {
+      logStep(trace, 'PUSH', `发送新增通知 ${added.length}`)
 
-        currentData = added
-        currentVersion = Date.now()
+      currentData = added
+      currentVersion = Date.now()
 
-        await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约')
+      await sendTelegram(added, currentVersion, '✨ 有新场地！点击直接预约')
+    }
+
+    // ========================
+    // ⭐🔥 AUTO_BOOK：每一轮都执行（核心改动）
+    // ========================
+    if (config.AUTO_BOOK && !autoBooking) {
+
+      const now = Date.now()
+      const delayMs = (config.AUTO_BOOK_DELAY_MINUTES || 2) * 60 * 1000
+      const maxWaitMs = (config.AUTO_BOOK_MAX_WAIT_MINUTES || 10) * 60 * 1000
+
+      logStep(trace, 'AUTO_POOL_SIZE', `pool=${autoCandidateMap.size}`)
+
+      const pool = []
+
+      for (const [uid, item] of autoCandidateMap.entries()) {
+        const { firstSeenAt, data: d } = item
+        const waited = now - firstSeenAt
+
+        logStep(trace, 'AUTO_POOL', `uid=${uid} waited=${Math.floor(waited / 1000)}s`)
+
+        if (waited < delayMs) continue
+
+        if (waited > maxWaitMs) {
+          autoCandidateMap.delete(uid)
+          continue
+        }
+
+        pool.push(d)
       }
 
-      // 再按“自动抢规则”挑选最合适的 slot 去预约
-      if (config.AUTO_BOOK && !autoBooking) {
-        const autoCandidates = filterSlotsAuto(added, config)
+      const autoCandidates = filterSlotsAuto(pool, config)
 
-        if (autoCandidates.length === 0) {
-          logStep(trace, 'AUTO_BOOK', `无匹配项（added=${added.length}）`)
+      if (autoCandidates.length === 0) {
+        logStep(trace, 'AUTO_BOOK', `无匹配（pool=${pool.length}）`)
+      } else {
+
+        const candidates = autoCandidates.filter(d => {
+          const startDate = parseSlotStartDateTimeSafe(d)
+          if (!startDate) return false
+
+          const diffMin = (startDate.getTime() - now) / 60000
+
+          if (diffMin < 20) return false
+
+          const dayKey = parseSlotDayKey(d)
+
+          if (dayKey && autoBookedDayKeys.has(dayKey)) return false
+
+          if (autoBookedUIDs.has(d.uid)) return false
+
+          return true
+        })
+
+        if (candidates.length === 0) {
+          logStep(trace, 'AUTO_BOOK', `筛选后无候选`)
         } else {
-          const now = Date.now()
 
-          // ✅ 基础过滤
-          const candidates = autoCandidates.filter(d => {
-            const startDate = parseSlotStartDateTimeSafe(d)
-            if (!startDate) return false
-          
-            const now = Date.now()
-            const diffMin = (startDate.getTime() - now) / 60000
-          
-            // ❌ 太近的不抢
-            if (diffMin < 20) return false
-          
+          const grouped = new Map()
+
+          for (const d of candidates) {
             const dayKey = parseSlotDayKey(d)
-          
-            // ❌ 已经抢过这一天（你原有逻辑）
-            if (dayKey && autoBookedDayKeys.has(dayKey)) return false
-          
-            // ❌ ⭐ 已经抢过这个 slot（新增核心）
-            if (autoBookedUIDs.has(d.uid)) return false
-          
-            return true
-          })
+            if (!dayKey) continue
 
-          if (candidates.length === 0) {
-            logStep(trace, 'AUTO_BOOK', `筛选后无候选（added=${added.length}，auto=${autoCandidates.length}）`)
+            if (!grouped.has(dayKey)) grouped.set(dayKey, [])
+            grouped.get(dayKey).push(d)
+          }
+
+          const targets = []
+
+          for (const [dayKey, list] of grouped.entries()) {
+            list.sort((a, b) => {
+              const ta = parseSlotStartDateTimeSafe(a)?.getTime() ?? -Infinity
+              const tb = parseSlotStartDateTimeSafe(b)?.getTime() ?? -Infinity
+              return tb - ta
+            })
+
+            targets.push(list[0])
+          }
+
+          if (targets.length === 0) {
+            logStep(trace, 'AUTO_BOOK', '分组后无目标')
           } else {
 
-            // ========================
-            // ⭐ 按天分组
-            // ========================
-            const grouped = new Map()
-
-            for (const d of candidates) {
-              const dayKey = parseSlotDayKey(d)
-              if (!dayKey) continue
-
-              if (!grouped.has(dayKey)) grouped.set(dayKey, [])
-              grouped.get(dayKey).push(d)
-            }
-
-            // ========================
-            // ⭐ 每天选最晚一个
-            // ========================
-            const targets = []
-
-            for (const [dayKey, list] of grouped.entries()) {
-              list.sort((a, b) => {
-                const ta = parseSlotStartDateTimeSafe(a)?.getTime() ?? -Infinity
-                const tb = parseSlotStartDateTimeSafe(b)?.getTime() ?? -Infinity
-                return tb - ta
-              })
-
-              const best = list[0]
-              targets.push(best)
-            }
-
-            if (targets.length === 0) {
-              logStep(trace, 'AUTO_BOOK', '分组后无目标')
-              return
-            }
-
-            logStep(
-              trace,
-              'AUTO_BOOK',
-              `准备一次性预约 ${targets.length} 个：` +
-              targets.map(d => `${d.place} ${d.time}`).join(' | ')
-            )
+            logStep(trace, 'AUTO_BOOK', `准备预约 ${targets.length} 个（延迟策略）`)
 
             autoBooking = true
 
             try {
-              // ========================
-              // ⭐ 一次性点击多个 slot
-              // ========================
+
               await Promise.all(
-                targets.map(async d => {
-                  logStep(trace, 'AUTO_BOOK', `选中 ${d.place} ${d.time}`)
-                  try {
-                    await clickSlot(page, d)
-                  } catch (e) {
-                    logStep(trace, 'AUTO_BOOK_CLICK_FAIL', `${d.domId}`)
-                    throw e
-                  }
-                })
+                targets.map(d => clickSlot(page, d))
               )
 
-              // ========================
-              // ⭐ 一次提交
-              // ========================
               await Promise.all([
                 page.waitForNavigation({ waitUntil: 'networkidle' }),
                 page.click('#ucPCFooter_btnForward')
               ])
 
-              await handleLoginIfNeeded(page)
-              await clickApply(page)
+              // await handleLoginIfNeeded(page)
+              // await clickApply(page)
 
-              // ========================
-              // ⭐ 标记已预约的日期
-              // ========================
               for (const d of targets) {
                 const dayKey = parseSlotDayKey(d)
-              
+
                 addBookedSlot(d)
-              
+
                 if (dayKey) autoBookedDayKeys.add(dayKey)
-              
-                // ⭐ 标记这个 slot 已经抢过
+
                 autoBookedUIDs.add(d.uid)
-                saveAutoBooked()
+                autoCandidateMap.delete(d.uid)
               }
 
-              // ========================
-              // ⭐ 通知
-              // ========================
+              saveAutoBooked()
+
               await bot.sendMessage(
                 process.env.CHAT_ID,
-                `🎉 *自动预约成功（多场）！*\n━━━━━━━━━━━━━━\n` +
+                `🎉 *自动预约成功（全量扫描）！*\n━━━━━━━━━━━━━━\n` +
                 targets.map(d => formatText(d, { showBike: true, style: 'detail' })).join('\n\n'),
                 { parse_mode: 'Markdown' }
               )
 
-              setTimeout(() => monitor({ forcePush: true }), 1000)
-
             } catch (e) {
-              // ⭐ 防止失败反复抢同一个 slot
+
               for (const d of targets) {
                 autoBookedUIDs.add(d.uid)
+                autoCandidateMap.delete(d.uid)
               }
 
               await bot.sendMessage(
                 process.env.CHAT_ID,
-                `❌ *自动预约失败（多场）*\n━━━━━━━━━━━━━━\n` +
-                targets.map(d => formatText(d, { style: 'detail' })).join('\n\n') +
-                `\n\n🧨 ${e.message}`,
+                `❌ *自动预约失败*\n━━━━━━━━━━━━━━\n🧨 ${e.message}`,
                 { parse_mode: 'Markdown' }
               )
+
             } finally {
               autoBooking = false
             }
           }
         }
       }
+    }
+
+    // ========================
+    // ⭐ 减少通知（保持原逻辑）
+    // ========================
+    if (removed.length > 0 && config.NOTIFY_REMOVED) {
+      logStep(trace, 'PUSH', `发送减少通知 ${removed.length}`)
+      await sendRemovedTelegram(removed)
     }
 
     if (removed.length > 0 && config.NOTIFY_REMOVED) {
@@ -1443,8 +1480,8 @@ async function bookOne(d, trace = createTrace()) {
   ])
 
   logStep(trace, 'BOOK', '提交预约')
-  await handleLoginIfNeeded(page)
-  await clickApply(page)
+  // await handleLoginIfNeeded(page)
+  // await clickApply(page)
 
   await bot.sendMessage(
     process.env.CHAT_ID,
