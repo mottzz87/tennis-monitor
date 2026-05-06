@@ -10,6 +10,9 @@ function buildPanelKeyboard() {
       [
         { text: '📍 场地开关', callback_data: 'quick_place' },
         { text: '📚 预约记录', callback_data: 'quick_booked' }
+      ],
+      [
+        { text: '📅 预约日程', callback_data: 'quick_schedule' }
       ]
     ]
   }
@@ -52,7 +55,9 @@ module.exports = function registerTelegramHandlers({
   removeBookedSlot,
   disableBookedReminder,
   pruneReminderIndexForUcode,
-  getBookedSlots
+  getBookedSlots,
+  getFutureBookedSlots,
+  parseSlotStartDateTimeSafe
 }) {
   bot.setMyCommands([
     { command: 'panel', description: '🎛️ 控制面板（常用）' },
@@ -60,6 +65,7 @@ module.exports = function registerTelegramHandlers({
     { command: 'status', description: '📊 系统状态' },
     { command: 'listplace', description: '📍 场地开关' },
     { command: 'booked', description: '📚 预约记录' },
+    { command: 'schedule', description: '📅 预约日程' },
     { command: 'stats', description: '📈 抢场统计' },
     { command: 'pause', description: '⏸️ 暂停监控' },
     { command: 'resume', description: '▶️ 恢复监控' },
@@ -110,6 +116,31 @@ module.exports = function registerTelegramHandlers({
       await bot.sendMessage(
         query.message.chat.id,
         `📚 预约记录（最近 ${list.length}/${total} 条）\n━━━━━━━━━━━━━━\n${lines.join('\n\n')}`
+      )
+      return
+    }
+
+    if (data === 'quick_schedule') {
+      await bot.answerCallbackQuery(query.id, { text: '📅 …' })
+      const future = getFutureBookedSlots()
+      if (future.length === 0) {
+        await bot.sendMessage(query.message.chat.id, '📅 暂无未开始的预约')
+        return
+      }
+      const sorted = future
+        .slice()
+        .sort((a, b) => {
+          const ta = parseSlotStartDateTimeSafe(a)?.getTime() ?? Infinity
+          const tb = parseSlotStartDateTimeSafe(b)?.getTime() ?? Infinity
+          return ta - tb
+        })
+      const lines = sorted.map((d, i) => {
+        const status = d.reminderEnabled === false ? '🔕' : '🔔'
+        return `${i + 1}. ${formatText(d, { style: 'detail' })}   ${status}`
+      })
+      await bot.sendMessage(
+        query.message.chat.id,
+        `📅 预约日程（共 ${future.length} 条，按时间排序）\n━━━━━━━━━━━━━━\n${lines.join('\n\n')}`
       )
       return
     }
@@ -441,6 +472,35 @@ ${placeStatus || '暂无场地'}
     )
   })
 
+  // schedule - upcoming bookings
+  bot.onText(/\/schedule/, async (msg) => {
+    if (!isAdmin(msg)) return
+
+    const future = getFutureBookedSlots()
+    if (future.length === 0) {
+      await bot.sendMessage(msg.chat.id, '📅 暂无未开始的预约')
+      return
+    }
+
+    const sorted = future
+      .slice()
+      .sort((a, b) => {
+        const ta = parseSlotStartDateTimeSafe(a)?.getTime() ?? Infinity
+        const tb = parseSlotStartDateTimeSafe(b)?.getTime() ?? Infinity
+        return ta - tb
+      })
+
+    const lines = sorted.map((d, i) => {
+      const status = d.reminderEnabled === false ? '🔕' : '🔔'
+      return `${i + 1}. ${formatText(d, { style: 'detail' })}   ${status}`
+    })
+
+    await bot.sendMessage(
+      msg.chat.id,
+      `📅 预约日程（共 ${future.length} 条，按时间排序）\n━━━━━━━━━━━━━━\n${lines.join('\n\n')}`
+    )
+  })
+
   bot.onText(/\/addplace (.+?) (.+?) (.+?) (.+)/, async (msg, match) => {
     if (!isAdmin(msg)) return
 
@@ -536,6 +596,7 @@ ${placeStatus || '暂无场地'}
       `/status  状态（含面板）\n` +
       `/listplace  场地开关\n` +
       `/booked  预约记录（可加条数，如 /booked 20）\n` +
+      `/schedule  预约日程\n` +
       `/stats  抢场统计\n` +
       `/pause · /resume  暂停/恢复定时扫描\n\n` +
       `【说明】\n` +
@@ -614,7 +675,7 @@ ${meta.emoji} ${meta.short}
   bot.onText(/\/stats/, async (msg) => {
     if (!isAdmin(msg)) return
 
-    const parts = stats.splitForTelegram(stats.buildReport(), 3800)
+    const parts = stats.splitForTelegram(stats.buildReport(config.PLACE_MAP), 3800)
     for (let i = 0; i < parts.length; i++) {
       const prefix = parts.length > 1 ? `(${i + 1}/${parts.length}) ` : ''
       await bot.sendMessage(msg.chat.id, prefix + parts[i])

@@ -89,15 +89,16 @@ function groupByPlace(list) {
   return map
 }
 
-function topNFromMap(map, n = 5) {
-  return Object.entries(map)
+function shortenPlaceName(name, placeMap) {
+  return placeMap?.[name]?.short || name
+}
+
+function topNWithShort(map, n, placeMap, sep = ' · ') {
+  const entries = Object.entries(map)
     .sort((a, b) => b[1] - a[1])
     .slice(0, n)
-    .map(([k, v]) => {
-      const short = k.length > 14 ? `${k.slice(0, 12)}…` : k
-      return `${short}×${v}`
-    })
-    .join(' · ') || '—'
+  if (entries.length === 0) return ''
+  return entries.map(([k, v]) => `${shortenPlaceName(k, placeMap)}×${v}`).join(sep)
 }
 
 function calcSpeedBuckets(stats) {
@@ -111,11 +112,11 @@ function calcSpeedBuckets(stats) {
   })
 
   const buckets = {
-    '≤1m': 0,
-    '≤3m': 0,
+    '≤2m': 0,
+    '≤5m': 0,
     '≤10m': 0,
-    '≤1h': 0,
-    '>1h': 0
+    '≤30m': 0,
+    '>30m': 0
   }
 
   let paired = 0
@@ -124,67 +125,81 @@ function calcSpeedBuckets(stats) {
     const diff = (r.time - addedMap.get(r.id)) / 1000
     if (diff < 0) return
     paired++
-    if (diff <= 60) buckets['≤1m']++
-    else if (diff <= 180) buckets['≤3m']++
+    if (diff <= 120) buckets['≤2m']++
+    else if (diff <= 300) buckets['≤5m']++
     else if (diff <= 600) buckets['≤10m']++
-    else if (diff <= 3600) buckets['≤1h']++
-    else buckets['>1h']++
+    else if (diff <= 1800) buckets['≤30m']++
+    else buckets['>30m']++
   })
 
   return { paired, buckets }
 }
 
-function formatSpeedLine(b) {
-  const { paired, buckets } = b
-  if (paired === 0) return '配对0次（需同 uid 先出现再消失）'
-  return `配对${paired}次 ` + Object.entries(buckets)
+/**
+ * 「出现→消失」速度展示
+ * 例：配对 8 次  ≤2m:5  ≤5m:2  ≤10m:1
+ */
+function formatSpeedLine({ paired, buckets }) {
+  if (paired === 0) return '配对 0 次'
+  const detail = Object.entries(buckets)
     .filter(([, v]) => v > 0)
     .map(([k, v]) => `${k}:${v}`)
-    .join(' ')
+    .join('  ')
+  return `配对 ${paired} 次  ${detail}`
 }
 
-function summarizePeriod(label, cutoffMs, allAdded, allRemoved) {
+/**
+ * 一个周期输出 1~2 行，保留全部原有指标
+ *
+ * 第 1 行：● 周期  📈出现N  📉消失N  ⚡高峰 出X时/消X时  🏟场地TOP
+ * 第 2 行（有配对时）：  ⏱消失速度 配对N次  ≤1m:N  ≤3m:N  …
+ */
+function summarizePeriod(label, cutoffMs, allAdded, allRemoved, placeMap) {
   const added = filterSince(allAdded, cutoffMs)
   const removed = filterSince(allRemoved, cutoffMs)
+
   const ah = groupByHour(added)
   const rh = groupByHour(removed)
-  const topAdded = topNFromMap(groupByPlace(added), 4)
-  const topRemoved = topNFromMap(groupByPlace(removed), 4)
+
   const peakA = Object.entries(ah).sort((a, b) => b[1] - a[1])[0]
   const peakR = Object.entries(rh).sort((a, b) => b[1] - a[1])[0]
-  const peakAText = peakA ? `${peakA[0]}时×${peakA[1]}` : '—'
-  const peakRText = peakR ? `${peakR[0]}时×${peakR[1]}` : '—'
-  const speed = formatSpeedLine(calcSpeedBuckets({ added, removed }))
 
-  return (
-    `【${label}】\n` +
-    `  记录: 出现 ${added.length} · 消失 ${removed.length}\n` +
-    `  高峰(本地时): 出现 ${peakAText} · 消失 ${peakRText}\n` +
-    `  场地(消失TOP): ${topRemoved}\n` +
-    `  速度: ${speed}`
-  )
+  const peakStr = peakA || peakR
+    ? `出${peakA ? peakA[0] + '时' : '—'}／消${peakR ? peakR[0] + '时' : '—'}`
+    : '—'
+
+  const topPlaces = topNWithShort(groupByPlace(removed), 4, placeMap, '  ')
+  const placeStr = topPlaces || '—'
+
+  const lines = [
+    `● ${label}  📈${added.length}  📉${removed.length}  ⚡${peakStr}  🏟${placeStr}`
+  ]
+
+  const { paired, buckets } = calcSpeedBuckets({ added, removed })
+  if (paired > 0) {
+    lines.push(`  ⏱${formatSpeedLine({ paired, buckets })}`)
+  }
+
+  return lines.join('\n')
 }
 
 /**
  * 一条汇总里包含：今天 / 7天 / 30天 / 半年 / 一年（均为「从该区间起点至今」累计）
  * 「今天」按运行本机的本地日历日 0 点起算。
+ * @param {object} [placeMap] - config.PLACE_MAP，用于缩短场地名
  */
-function buildReport() {
+function buildReport(placeMap) {
   const allAdded = readLogLines(LOG_ADDED)
   const allRemoved = readLogLines(LOG_REMOVED)
 
-  const header =
-    '📊 抢场统计 · 多周期汇总\n' +
-    '━━━━━━━━━━━━━━\n' +
-    '各段均为：从区间起点 → 现在的累计。\n' +
-    '「今天」= 本机时区当日 0 点起。\n'
+  const header = '📊 抢场统计\n━━━━━━━━━━━━━━━━━━\n'
 
   const blocks = PERIODS.map(p => {
     const cut = periodCutoff(p)
-    return summarizePeriod(p.label, cut, allAdded, allRemoved)
+    return summarizePeriod(p.label, cut, allAdded, allRemoved, placeMap)
   })
 
-  return header + '\n' + blocks.join('\n\n')
+  return header + blocks.join('\n')
 }
 
 function splitForTelegram(text, maxLen = 3800) {

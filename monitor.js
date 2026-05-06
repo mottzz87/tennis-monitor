@@ -1081,7 +1081,7 @@ async function monitor(options = {}) {
     .filter(k => !newSet.has(k))
     .map(k => {
       const [place, court, date, time] = k.split('_')
-      return { place, court, date, time }
+      return { place, court, date, time, uid: k }
     })
     .filter(d => config.TARGET_PLACE.includes(d.place)) // ⭐关键过滤
     // ⭐ 统计埋点
@@ -1479,7 +1479,9 @@ registerTelegramHandlers({
   disableBookedReminder,
   deleteReminderMessagesByUcode,
   pruneReminderIndexForUcode,
-  getBookedSlots
+  getBookedSlots,
+  getFutureBookedSlots,
+  parseSlotStartDateTimeSafe
 })
 
 // ========================
